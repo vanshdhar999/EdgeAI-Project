@@ -24,6 +24,34 @@ from keras import layers
 
 from augmentation import normalize, build_augmentation_pipeline
 
+# ---------------------------------------------------------------------------
+# Python 3.12 + TF compatibility patch
+# ---------------------------------------------------------------------------
+# Python 3.12 tightened inspect.getattr_static() so it raises TypeError on
+# objects whose __dict__ descriptor is non-standard (e.g. TF's _DictWrapper).
+# TF's tensor_util.is_tf_type() calls isinstance() → typing.__instancecheck__
+# → inspect.getattr_static() and crashes instead of returning False.
+# Returning False is the correct answer for _DictWrapper (it's a Trackable,
+# not a tensor). The Trackable branch downstream handles it correctly.
+# This patch applies to both tf.saved_model.save() and model.export() paths.
+def _apply_python312_tf_patch() -> None:
+    try:
+        import tensorflow.python.framework.tensor_util as _tu
+        _orig = _tu.is_tf_type
+
+        def _safe_is_tf_type(x):
+            try:
+                return _orig(x)
+            except TypeError:
+                return False
+
+        _tu.is_tf_type = _safe_is_tf_type
+    except Exception:
+        pass  # if patch fails, let the original error surface normally
+
+
+_apply_python312_tf_patch()
+
 
 # ---------------------------------------------------------------------------
 # Config — all hyper-parameters in one place for easy tuning
