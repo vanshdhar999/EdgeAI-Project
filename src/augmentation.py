@@ -48,16 +48,17 @@ def random_flip(image: tf.Tensor) -> tf.Tensor:
 def random_rotation(image: tf.Tensor) -> tf.Tensor:
     """
     Rotate image by a random angle in [-30°, +30°].
-    Uses tf.keras.layers.RandomRotation internally via a stateless approach.
+
+    NOTE: This standalone function is kept for reference but should NOT be
+    called inside tf.data.map() — doing so re-instantiates the Keras layer on
+    every image, breaking graph tracing.  Use build_augmentation_pipeline()
+    instead, which creates the layer once and reuses it across all images.
     """
-    # tf.raw_ops or keras preprocessing layer wrapped as a function
-    # We use tf.keras layers applied eagerly-compatible way
     rotator = tf.keras.layers.RandomRotation(
         factor=ROTATION_FACTOR,
         fill_mode="reflect",
         interpolation="bilinear",
     )
-    # Add/remove batch dim
     image = rotator(tf.expand_dims(image, 0), training=True)
     return tf.squeeze(image, 0)
 
@@ -102,6 +103,11 @@ def build_augmentation_pipeline(
     """
     Build and return a single augmentation function suitable for tf.data.map().
 
+    The RandomRotation Keras layer is instantiated ONCE here (not inside the
+    returned closure) so that graph tracing works correctly when this function
+    is used inside tf.map_fn or tf.data.Dataset.map().  Instantiating Keras
+    preprocessing layers per image breaks graph tracing and reproducibility.
+
     Args:
         use_rotation: Apply random ±30° rotation (default True).
         use_zoom:     Apply random zoom crop (default True).
@@ -113,12 +119,18 @@ def build_augmentation_pipeline(
         A callable that takes a float32 image tensor [H, W, 3] in [0,1]
         and returns an augmented tensor of the same shape.
     """
+    # Instantiate the rotation layer once here so it is shared across all
+    # images in the tf.data pipeline, avoiding repeated layer creation that
+    # breaks TF graph tracing.
+    rotator = tf.keras.layers.RandomRotation(
+        factor=ROTATION_FACTOR, fill_mode="reflect", interpolation="bilinear"
+    )
 
     def augment(image: tf.Tensor) -> tf.Tensor:
         image = random_flip(image)
         image = random_brightness_contrast(image)
         if use_rotation:
-            image = random_rotation(image)
+            image = tf.squeeze(rotator(tf.expand_dims(image, 0), training=True), 0)
         if use_zoom:
             image = random_zoom(image, target_size=target_size)
         if use_noise:
