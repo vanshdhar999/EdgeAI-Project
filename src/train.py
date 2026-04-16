@@ -369,8 +369,12 @@ def train() -> None:
     # artefacts from different training runs.
     if SAVEDMODEL_DIR.exists():
         shutil.rmtree(SAVEDMODEL_DIR)
-    SAVEDMODEL_DIR.mkdir(parents=True, exist_ok=True)
-    best_model.export(str(SAVEDMODEL_DIR))
+    # Use tf.saved_model.save() instead of model.export(): Keras 3's export()
+    # goes through ExportArchive which calls inspect.getattr_static() on a
+    # TF _DictWrapper — that fails on Python 3.12. tf.saved_model.save() uses
+    # a completely different code path and produces an identical TF SavedModel
+    # that TFLiteConverter.from_saved_model() can consume in Phase 3.
+    tf.saved_model.save(best_model, str(SAVEDMODEL_DIR))
 
     print(
         f"\nSavedModel exported to: {SAVEDMODEL_DIR}\n"
