@@ -37,11 +37,13 @@ _DATA_DIR   = _PROJECT / "data" / "processed" / "test"
 _DOCS_DIR   = _PROJECT / "docs"
 _LABELS_TXT = _MODELS_DIR / "labels.txt"
 
-# Candidate model paths, tried in order
+# Candidate model paths, tried in order.
+# SavedModel format is excluded: Keras 3's load_model() does not support it
+# (only .keras / .h5). The SavedModel is used only by quantize.py via
+# tf.lite.TFLiteConverter, not for Python-level evaluation.
 _MODEL_CANDIDATES = [
-    _MODELS_DIR / "plant_disease_savedmodel",
-    _MODELS_DIR / "checkpoints" / "best_stage2.keras",
     _MODELS_DIR / "checkpoints" / "best_stage1.keras",
+    _MODELS_DIR / "checkpoints" / "best_stage2.keras",
 ]
 
 # Dataset parameters
