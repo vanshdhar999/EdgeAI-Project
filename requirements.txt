@@ -5,16 +5,21 @@
 #
 # GPU note:
 #   On Linux with NVIDIA GPU, use:
-#     pip install tensorflow[and-cuda]==2.16.1
+#     pip install tensorflow[and-cuda]>=2.18.0
 #   instead of plain tensorflow — it pulls in CUDA/cuDNN wheels automatically.
+#
+#   TF 2.16.x does NOT include pre-compiled CUDA kernels for RTX 5090 (Blackwell,
+#   compute capability 12.0a). Using TF 2.16 will trigger a 30+ minute one-time
+#   JIT PTX compilation before epoch 1. Upgrade to TF 2.18+ to avoid this.
+#
 #   On macOS (Apple Silicon), replace with:
 #     pip install tensorflow==2.16.1 tensorflow-metal
 #
 # Python: 3.10+ recommended (tested on 3.12.2)
 
 # Core ML framework
-tensorflow==2.16.1
-keras==3.14.0
+tensorflow>=2.18.0
+keras>=3.14.0
 
 # Model optimization (INT8 quantization, pruning)
 tensorflow-model-optimization==0.8.0

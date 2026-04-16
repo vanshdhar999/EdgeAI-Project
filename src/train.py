@@ -74,7 +74,7 @@ def build_dataset(
     split_dir: Path,
     class_names: list[str],
     augment: bool = False,
-) -> tf.data.Dataset:
+) -> tuple[tf.data.Dataset, list[str]]:
     """
     Build a tf.data pipeline for a given split directory.
 
@@ -91,18 +91,28 @@ def build_dataset(
         augment:     If True, apply the training augmentation pipeline.
 
     Returns:
-        A batched, prefetched tf.data.Dataset yielding (image, label) pairs
-        where image is float32 [0, 1] and label is an int32 class index.
+        Tuple of (dataset, actual_class_names) where:
+        - dataset is a batched, prefetched tf.data.Dataset yielding (image, label)
+          pairs where image is float32 [0, 1] and label is an int32 class index.
+        - actual_class_names is the alphabetically sorted list Keras actually used,
+          read from the raw dataset before transformations are applied.
+          (.class_names is lost after .map()/.prefetch() wrap the dataset.)
     """
-    ds: tf.data.Dataset = keras.utils.image_dataset_from_directory(
+    raw_ds: tf.data.Dataset = keras.utils.image_dataset_from_directory(
         str(split_dir),
-        class_names=class_names,   # preserves label order from labels.txt
+        class_names=class_names,   # restricts which classes to include
         image_size=IMAGE_SIZE,
         batch_size=BATCH_SIZE,
         label_mode="int",
         shuffle=(augment),         # shuffle only the training set
         seed=RANDOM_SEED,
     )
+
+    # Capture class names NOW — before chaining .map()/.prefetch() which
+    # wrap the dataset in _MapDataset/_PrefetchDataset and lose this attribute.
+    actual_class_names: list[str] = raw_ds.class_names
+
+    ds = raw_ds
 
     # Normalise: uint8 [0,255] → float32 [0,1]
     ds = ds.map(
@@ -119,7 +129,7 @@ def build_dataset(
         )
 
     ds = ds.prefetch(tf.data.AUTOTUNE)
-    return ds
+    return ds, actual_class_names
 
 
 def build_model(num_classes: int) -> tuple[keras.Model, keras.Model]:
@@ -253,19 +263,18 @@ def train() -> None:
     num_classes = len(class_names)
     print(f"Classes ({num_classes}) from labels.txt: {class_names}")
 
-    train_ds = build_dataset(DATA_DIR / "train", class_names, augment=True)
-
     # keras.utils.image_dataset_from_directory always sorts class_names
-    # alphabetically regardless of the order passed in.  Read back the actual
-    # sorted order Keras used and overwrite labels.txt so that the label file
-    # matches the trained model's output indices exactly.
-    actual_classes: list[str] = train_ds.class_names
+    # alphabetically regardless of the order passed in.  build_dataset() reads
+    # back the actual sorted order from the raw dataset (before .map/.prefetch
+    # wrap it and lose .class_names) and returns it alongside the dataset.
+    train_ds, actual_classes = build_dataset(DATA_DIR / "train", class_names, augment=True)
+
     LABELS_FILE.write_text("\n".join(actual_classes) + "\n", encoding="utf-8")
     print(f"labels.txt updated to match training order: {actual_classes}")
 
-    # Val and test datasets must use the same sorted class list so all splits
-    # share identical label-to-index mappings.
-    val_ds   = build_dataset(DATA_DIR / "val",   actual_classes, augment=False)
+    # Val dataset must use the same sorted class list so all splits share
+    # identical label-to-index mappings.
+    val_ds, _ = build_dataset(DATA_DIR / "val", actual_classes, augment=False)
 
     # ------------------------------------------------------------------
     # 2. Build model
