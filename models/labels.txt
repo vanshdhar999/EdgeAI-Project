@@ -1,0 +1,5 @@
+Tomato___healthy
+Tomato___Early_blight
+Tomato___Late_blight
+Tomato___Bacterial_spot
+Tomato___Septoria_leaf_spot
