@@ -1,0 +1,33 @@
+# requirements.txt — GPU training machine (Linux + NVIDIA GPU recommended)
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# GPU note:
+#   On Linux with NVIDIA GPU, use:
+#     pip install tensorflow[and-cuda]==2.16.1
+#   instead of plain tensorflow — it pulls in CUDA/cuDNN wheels automatically.
+#   On macOS (Apple Silicon), replace with:
+#     pip install tensorflow==2.16.1 tensorflow-metal
+#
+# Python: 3.10+ recommended (tested on 3.12.2)
+
+# Core ML framework
+tensorflow==2.16.1
+keras==3.14.0
+
+# Model optimization (INT8 quantization, pruning)
+tensorflow-model-optimization==0.8.0
+
+# Data
+numpy==1.26.4
+pillow==12.2.0
+scikit-learn==1.6.0
+scipy==1.13.1
+
+# Visualization
+matplotlib==3.8.4
+opencv-python==4.11.0.86
+
+# Utilities
+tqdm==4.67.3

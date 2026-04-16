@@ -1,0 +1,20 @@
+# requirements_pi.txt — Raspberry Pi 5 deployment dependencies
+#
+# Install with:
+#   pip3 install -r deployment/requirements_pi.txt
+#
+# Note: picamera2 is pre-installed on Raspberry Pi OS (Bookworm).
+# If missing, install via apt: sudo apt install -y python3-picamera2
+#
+# Do NOT install full tensorflow on the Pi — use tflite-runtime only.
+# Python: 3.11.2 (confirmed on device)
+
+# Edge inference runtime (lightweight, ARM-optimized)
+tflite-runtime==2.14.0
+
+# Image capture and processing
+opencv-python==4.11.0.86
+numpy==1.26.4
+
+# Camera interface (usually pre-installed on Pi OS Bookworm)
+# picamera2==0.3.31
