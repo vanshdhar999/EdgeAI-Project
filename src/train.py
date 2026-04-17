@@ -75,29 +75,32 @@ def _apply_compat_patches() -> None:
     except Exception:
         pass
 
-    try:
-        from tensorflow.python.checkpoint import trackable_view as _tv
-        _orig_children = _tv.ObjectGraphView.children
-
+    def _make_children_filter(method):
+        import functools
+        @functools.wraps(method)
         def _safe_children(self, obj, **kwargs):
-            result = {}
             try:
-                pairs = list(self.list_children(obj, **kwargs))
-            except Exception:
-                return result
-            from tensorflow.python.trackable import converter as _tconv2
-            for name, ref in pairs:
-                try:
-                    ref = _tconv2.convert_to_trackable(ref, parent=obj)
-                except AttributeError:
-                    ref = None
-                if ref is not None:
-                    result[name] = ref
+                result = method(self, obj, **kwargs)
+            except AttributeError:
+                return {}
+            if isinstance(result, dict):
+                return {k: v for k, v in result.items() if v is not None}
             return result
+        return _safe_children
 
-        _tv.ObjectGraphView.children = _safe_children
-    except Exception:
-        pass
+    for _module_path in (
+        'tensorflow.python.checkpoint.trackable_view',
+        'keras.src.export.saved_model_export_archive',
+    ):
+        try:
+            import importlib as _il
+            _mod = _il.import_module(_module_path)
+            for _cname in dir(_mod):
+                _cls = getattr(_mod, _cname, None)
+                if isinstance(_cls, type) and 'children' in _cls.__dict__:
+                    _cls.children = _make_children_filter(_cls.children)
+        except Exception:
+            pass
 
 
 _apply_compat_patches()

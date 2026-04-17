@@ -129,33 +129,46 @@ def _apply_compat_patches() -> None:
     except Exception:
         pass
 
-    # (c) belt-and-suspenders: patch ObjectGraphView.children to catch the error
-    #     in case the converter function is looked up freshly each call
-    try:
-        from tensorflow.python.checkpoint import trackable_view as _tv
+    # (c) Filter None values out of every children() return value.
+    #
+    # With patch (a)/(b) in place, convert_to_trackable() now returns None for
+    # plain dict refs instead of crashing.  But the original children() code
+    # adds that None directly to its result dict, _descendants_with_paths then
+    # enqueues None into the BFS queue, and the next children(None) call
+    # crashes at obj._maybe_initialize_trackable() (AttributeError on NoneType).
+    #
+    # Fix: wrap every children() defined in the relevant modules so None values
+    # are stripped from the result before it reaches the BFS loop.
+    # We check `cls.__dict__` so we only wrap classes that OWN the method —
+    # this avoids double-wrapping through inheritance and handles whatever class
+    # name TF 2.16 actually uses (it may not be 'ObjectGraphView').
 
-        _orig_children = _tv.ObjectGraphView.children
-
+    def _make_children_filter(method):
+        import functools
+        @functools.wraps(method)
         def _safe_children(self, obj, **kwargs):
-            result = {}
-            # list_children returns (name, ref) pairs; we iterate safely
             try:
-                pairs = list(self.list_children(obj, **kwargs))
-            except Exception:
-                return result
-            from tensorflow.python.trackable import converter as _tconv2
-            for name, ref in pairs:
-                try:
-                    ref = _tconv2.convert_to_trackable(ref, parent=obj)
-                except AttributeError:
-                    ref = None
-                if ref is not None:
-                    result[name] = ref
+                result = method(self, obj, **kwargs)
+            except AttributeError:
+                return {}
+            if isinstance(result, dict):
+                return {k: v for k, v in result.items() if v is not None}
             return result
+        return _safe_children
 
-        _tv.ObjectGraphView.children = _safe_children
-    except Exception:
-        pass
+    for _module_path in (
+        'tensorflow.python.checkpoint.trackable_view',
+        'keras.src.export.saved_model_export_archive',
+    ):
+        try:
+            import importlib as _il
+            _mod = _il.import_module(_module_path)
+            for _cname in dir(_mod):
+                _cls = getattr(_mod, _cname, None)
+                if isinstance(_cls, type) and 'children' in _cls.__dict__:
+                    _cls.children = _make_children_filter(_cls.children)
+        except Exception:
+            pass
 
 
 _apply_compat_patches()
