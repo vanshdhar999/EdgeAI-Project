@@ -1,9 +1,15 @@
 """
 quantize.py — INT8 post-training quantization and TFLite export.
 
-Converts the trained SavedModel (or .keras checkpoint) to two TFLite variants:
+Converts the trained .keras checkpoint to two TFLite variants:
   1. Float32 baseline  → models/plant_disease_float32.tflite
   2. INT8 quantized    → models/plant_disease.tflite  (final deployment model)
+
+We load from the .keras checkpoint (not the SavedModel) because tf.saved_model.save()
+with the Python 3.12 patch can produce a SavedModel with missing ReadVariableOp
+'value' attributes, which causes TFLiteConverter's MLIR frontend to abort.
+TFLiteConverter.from_keras_model() traces the model live from weights and avoids
+this issue entirely.
 
 INT8 quantization uses a representative dataset of 200 training-set images to
 calibrate activation ranges.  Float32 I/O is preserved so inference.py and
@@ -88,20 +94,20 @@ def load_class_names(labels_path: Path) -> list[str]:
     ]
 
 
-def load_source_model() -> tuple[object, str]:
+def load_source_model() -> tuple[keras.Model, str]:
     """
-    Load the trained model, preferring SavedModel then falling back to
-    .keras checkpoints.
+    Load the trained Keras model from a .keras checkpoint.
+
+    Always loads from .keras (not SavedModel): tf.saved_model.save() with the
+    Python 3.12 _DictWrapper patch can produce a SavedModel missing ReadVariableOp
+    'value' attributes, which causes TFLiteConverter's MLIR frontend to abort with
+    "LLVM ERROR: Failed to infer result type(s)".  Loading from .keras and using
+    TFLiteConverter.from_keras_model() traces the graph live from weights, avoiding
+    the corrupted protobuf entirely.
 
     Returns:
-        (model_or_path, source_description) where model_or_path is either
-        a path string (for SavedModel, used directly by TFLiteConverter) or
-        a keras.Model (for .keras checkpoints).
+        (keras_model, source_description)
     """
-    if SAVEDMODEL_DIR.exists():
-        print(f"  Using SavedModel: {SAVEDMODEL_DIR}")
-        return str(SAVEDMODEL_DIR), "SavedModel"
-
     for ckpt in (CHECKPOINT_DIR / "best_stage1.keras",
                  CHECKPOINT_DIR / "best_stage2.keras"):
         if ckpt.exists():
@@ -110,9 +116,8 @@ def load_source_model() -> tuple[object, str]:
             return model, f"Keras checkpoint ({ckpt.name})"
 
     raise FileNotFoundError(
-        "No trained model found. Run src/train.py first.\n"
-        f"  Looked for: {SAVEDMODEL_DIR}\n"
-        f"             {CHECKPOINT_DIR / 'best_stage1.keras'}\n"
+        "No .keras checkpoint found. Run src/train.py first.\n"
+        f"  Looked for: {CHECKPOINT_DIR / 'best_stage1.keras'}\n"
         f"             {CHECKPOINT_DIR / 'best_stage2.keras'}"
     )
 
@@ -174,25 +179,21 @@ def make_representative_dataset(calibration_images: list[np.ndarray]):
 # Conversion
 # ---------------------------------------------------------------------------
 
-def convert_to_tflite_float32(source) -> bytes:
+def convert_to_tflite_float32(source: keras.Model) -> bytes:
     """
     Convert the trained model to a float32 TFLite model (unquantized baseline).
 
     Args:
-        source: Either a SavedModel path (str) or a keras.Model.
+        source: Loaded keras.Model.
 
     Returns:
         Serialised TFLite flatbuffer bytes.
     """
-    if isinstance(source, str):
-        converter = tf.lite.TFLiteConverter.from_saved_model(source)
-    else:
-        converter = tf.lite.TFLiteConverter.from_keras_model(source)
-
+    converter = tf.lite.TFLiteConverter.from_keras_model(source)
     return converter.convert()
 
 
-def convert_to_tflite_int8(source, calibration_images: list[np.ndarray]) -> bytes:
+def convert_to_tflite_int8(source: keras.Model, calibration_images: list[np.ndarray]) -> bytes:
     """
     Convert the trained model to an INT8 post-training quantized TFLite model.
 
@@ -204,16 +205,13 @@ def convert_to_tflite_int8(source, calibration_images: list[np.ndarray]) -> byte
       determine per-layer activation ranges.
 
     Args:
-        source:             SavedModel path (str) or keras.Model.
+        source:             Loaded keras.Model.
         calibration_images: Pre-collected calibration images (float32, [0, 1]).
 
     Returns:
         Serialised TFLite flatbuffer bytes.
     """
-    if isinstance(source, str):
-        converter = tf.lite.TFLiteConverter.from_saved_model(source)
-    else:
-        converter = tf.lite.TFLiteConverter.from_keras_model(source)
+    converter = tf.lite.TFLiteConverter.from_keras_model(source)
 
     # Enable post-training integer quantization
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
@@ -234,38 +232,28 @@ def convert_to_tflite_int8(source, calibration_images: list[np.ndarray]) -> byte
 # ---------------------------------------------------------------------------
 
 def validate_outputs(
-    source,
+    source: keras.Model,
     tflite_bytes: bytes,
     calibration_images: list[np.ndarray],
     num_checks: int = 10,
     tolerance: float = 0.05,
 ) -> bool:
     """
-    Verify that TFLite model outputs closely match the Keras/SavedModel outputs
+    Verify that TFLite model outputs closely match the Keras model outputs
     on the same inputs.
 
     Args:
-        source:            SavedModel path (str) or keras.Model.
-        tflite_bytes:      INT8 TFLite model bytes.
+        source:             Loaded keras.Model (reference for comparison).
+        tflite_bytes:       INT8 TFLite model bytes.
         calibration_images: Pool of images to sample from.
-        num_checks:        Number of images to compare.
-        tolerance:         Max allowed absolute difference between top-1 probabilities.
+        num_checks:         Number of images to compare.
+        tolerance:          Max allowed absolute difference between top-1 probabilities.
 
     Returns:
         True if all checks pass, False otherwise.
     """
-    # Load reference model
-    if isinstance(source, str):
-        ref_model = tf.saved_model.load(source)
-        infer_fn = ref_model.signatures["serving_default"]
-
-        def ref_predict(x: np.ndarray) -> np.ndarray:
-            input_key = list(infer_fn.structured_input_signature[1].keys())[0]
-            out = infer_fn(**{input_key: tf.constant(x)})
-            return list(out.values())[0].numpy()
-    else:
-        def ref_predict(x: np.ndarray) -> np.ndarray:
-            return source.predict(x, verbose=0)
+    def ref_predict(x: np.ndarray) -> np.ndarray:
+        return source.predict(x, verbose=0)
 
     # Set up TFLite interpreter
     interp = tf.lite.Interpreter(model_content=tflite_bytes)
