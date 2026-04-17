@@ -42,17 +42,20 @@ import keras
 # Python 3.12 + TF _DictWrapper compatibility patch (see train.py for details)
 # ---------------------------------------------------------------------------
 def _apply_python312_tf_patch() -> None:
+    import sys
+    if sys.version_info < (3, 12):
+        return
+    import inspect
     try:
-        import tensorflow.python.framework.tensor_util as _tu
-        _orig = _tu.is_tf_type
+        _orig = inspect._check_instance
 
-        def _safe_is_tf_type(x):
+        def _safe_check_instance(obj, attr):
             try:
-                return _orig(x)
+                return _orig(obj, attr)
             except TypeError:
-                return False
+                return {}
 
-        _tu.is_tf_type = _safe_is_tf_type
+        inspect._check_instance = _safe_check_instance
     except Exception:
         pass
 

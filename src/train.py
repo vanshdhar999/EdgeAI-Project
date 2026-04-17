@@ -29,25 +29,26 @@ from augmentation import normalize, build_augmentation_pipeline
 # ---------------------------------------------------------------------------
 # Python 3.12 tightened inspect.getattr_static() so it raises TypeError on
 # objects whose __dict__ descriptor is non-standard (e.g. TF's _DictWrapper).
-# TF's tensor_util.is_tf_type() calls isinstance() → typing.__instancecheck__
-# → inspect.getattr_static() and crashes instead of returning False.
-# Returning False is the correct answer for _DictWrapper (it's a Trackable,
-# not a tensor). The Trackable branch downstream handles it correctly.
-# This patch applies to both tf.saved_model.save() and model.export() paths.
+# Patching inspect._check_instance (the exact callsite) to return {} on
+# TypeError lets isinstance() complete normally — _DictWrapper correctly
+# resolves to False without bypassing TF's variable serialization logic.
 def _apply_python312_tf_patch() -> None:
+    import sys
+    if sys.version_info < (3, 12):
+        return
+    import inspect
     try:
-        import tensorflow.python.framework.tensor_util as _tu
-        _orig = _tu.is_tf_type
+        _orig = inspect._check_instance
 
-        def _safe_is_tf_type(x):
+        def _safe_check_instance(obj, attr):
             try:
-                return _orig(x)
+                return _orig(obj, attr)
             except TypeError:
-                return False
+                return {}
 
-        _tu.is_tf_type = _safe_is_tf_type
+        inspect._check_instance = _safe_check_instance
     except Exception:
-        pass  # if patch fails, let the original error surface normally
+        pass
 
 
 _apply_python312_tf_patch()
