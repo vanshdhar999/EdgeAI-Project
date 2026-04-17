@@ -182,24 +182,35 @@ def make_representative_dataset(calibration_images: list[np.ndarray]):
 
 def save_temp_savedmodel(source: keras.Model) -> Path:
     """
-    Serialize the Keras model to a temporary SavedModel directory.
+    Serialize the Keras model to a temporary SavedModel directory via Keras 3's
+    model.export() rather than tf.saved_model.save().
 
-    from_saved_model() is the canonical TFLite conversion path: tensor names
-    in the SavedModel match what TFLite's calibrator expects, so representative
-    dataset samples are correctly attributed to input ops. Alternatives fail:
-    - from_keras_model(): removed internal Keras 2 hook crashes in Keras 3
-    - from_concrete_functions(): auto-generated tensor names break calibration,
-      causing silent zero-statistics and completely wrong INT8 activation ranges
+    Why not tf.saved_model.save(model, ...):
+      Keras 3 stores some internal attributes as plain Python dicts. When
+      tf.saved_model.save() traverses the Trackable object graph it reaches
+      one of these dicts and calls obj.dtype on it, crashing with:
+        AttributeError: 'dict' object has no attribute 'dtype'
 
-    The inspect._check_instance patch applied at module load ensures that Python
-    3.12's stricter getattr_static() does not raise TypeError on _DictWrapper,
-    so all conv/dense weights are captured correctly in the SavedModel.
+    Why model.export() works:
+      Keras 3's export() wraps the model in an ExportArchive — a clean
+      tf.Module whose Trackable graph is built solely from traced concrete
+      functions and explicitly tracked variables. tf.saved_model.save() is
+      then called on that tf.Module (not the raw Keras model), so it never
+      encounters plain dict attributes.
+
+    Why from_saved_model() is used for TFLite conversion:
+      It is the canonical path and assigns stable tensor names to all ops.
+      TFLite's calibrator matches representative dataset samples to input
+      tensors by name; stable names are required for correct INT8 calibration.
+      from_concrete_functions() produces auto-generated names that the
+      calibrator cannot match, causing silent zero-statistics and wrong
+      INT8 activation ranges.
 
     Returns:
         Path to the temporary SavedModel directory (caller must delete it).
     """
     tmp_dir = Path(tempfile.mkdtemp(prefix="tflite_export_"))
-    tf.saved_model.save(source, str(tmp_dir))
+    source.export(str(tmp_dir))
     return tmp_dir
 
 
