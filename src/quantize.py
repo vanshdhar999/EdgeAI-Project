@@ -87,18 +87,73 @@ def _apply_compat_patches() -> None:
             pass
 
     # Patch 2 — Keras 3 dict attributes in Trackable graph traversal
+    #
+    # trackable_view.py calls:  converter.convert_to_trackable(ref, parent=obj)
+    # where `converter` is the tensorflow.python.trackable.converter MODULE.
+    # In TF 2.16 this is a module-level function, NOT a class method — so
+    # patching Converter.convert_to_trackable has no effect on that call path.
+    #
+    # Strategy: patch every possible location where the function lives:
+    #   a) as a module-level function   (_tconv.convert_to_trackable)
+    #   b) as a Converter class method  (_tconv.Converter.convert_to_trackable)
+    # Then also patch the ObjectGraphView.children caller as a belt-and-suspenders
+    # fallback in case neither (a) nor (b) catches the right instance.
+
+    def _make_safe_ctt(fn):
+        """Return a wrapper that returns None on AttributeError ('dict.dtype')."""
+        import functools
+        @functools.wraps(fn)
+        def _wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except AttributeError:
+                return None
+        return _wrapper
+
+    # (a) module-level function
     try:
         from tensorflow.python.trackable import converter as _tconv
+        if callable(getattr(_tconv, 'convert_to_trackable', None)):
+            _tconv.convert_to_trackable = _make_safe_ctt(_tconv.convert_to_trackable)
+    except Exception:
+        pass
 
-        _orig_ctt = _tconv.Converter.convert_to_trackable
+    # (b) class method on Converter
+    try:
+        from tensorflow.python.trackable import converter as _tconv
+        if hasattr(_tconv, 'Converter') and callable(
+                getattr(_tconv.Converter, 'convert_to_trackable', None)):
+            _tconv.Converter.convert_to_trackable = _make_safe_ctt(
+                _tconv.Converter.convert_to_trackable
+            )
+    except Exception:
+        pass
 
-        def _safe_convert_to_trackable(self, ref, parent=None):
+    # (c) belt-and-suspenders: patch ObjectGraphView.children to catch the error
+    #     in case the converter function is looked up freshly each call
+    try:
+        from tensorflow.python.checkpoint import trackable_view as _tv
+
+        _orig_children = _tv.ObjectGraphView.children
+
+        def _safe_children(self, obj, **kwargs):
+            result = {}
+            # list_children returns (name, ref) pairs; we iterate safely
             try:
-                return _orig_ctt(self, ref, parent=parent)
-            except AttributeError:
-                return None  # Skip plain dicts and other non-Tensor/Trackable objects
+                pairs = list(self.list_children(obj, **kwargs))
+            except Exception:
+                return result
+            from tensorflow.python.trackable import converter as _tconv2
+            for name, ref in pairs:
+                try:
+                    ref = _tconv2.convert_to_trackable(ref, parent=obj)
+                except AttributeError:
+                    ref = None
+                if ref is not None:
+                    result[name] = ref
+            return result
 
-        _tconv.Converter.convert_to_trackable = _safe_convert_to_trackable
+        _tv.ObjectGraphView.children = _safe_children
     except Exception:
         pass
 

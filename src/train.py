@@ -48,18 +48,54 @@ def _apply_compat_patches() -> None:
         except Exception:
             pass
 
-    try:
-        from tensorflow.python.trackable import converter as _tconv
-
-        _orig_ctt = _tconv.Converter.convert_to_trackable
-
-        def _safe_convert_to_trackable(self, ref, parent=None):
+    def _make_safe_ctt(fn):
+        import functools
+        @functools.wraps(fn)
+        def _wrapper(*args, **kwargs):
             try:
-                return _orig_ctt(self, ref, parent=parent)
+                return fn(*args, **kwargs)
             except AttributeError:
                 return None
+        return _wrapper
 
-        _tconv.Converter.convert_to_trackable = _safe_convert_to_trackable
+    try:
+        from tensorflow.python.trackable import converter as _tconv
+        if callable(getattr(_tconv, 'convert_to_trackable', None)):
+            _tconv.convert_to_trackable = _make_safe_ctt(_tconv.convert_to_trackable)
+    except Exception:
+        pass
+
+    try:
+        from tensorflow.python.trackable import converter as _tconv
+        if hasattr(_tconv, 'Converter') and callable(
+                getattr(_tconv.Converter, 'convert_to_trackable', None)):
+            _tconv.Converter.convert_to_trackable = _make_safe_ctt(
+                _tconv.Converter.convert_to_trackable
+            )
+    except Exception:
+        pass
+
+    try:
+        from tensorflow.python.checkpoint import trackable_view as _tv
+        _orig_children = _tv.ObjectGraphView.children
+
+        def _safe_children(self, obj, **kwargs):
+            result = {}
+            try:
+                pairs = list(self.list_children(obj, **kwargs))
+            except Exception:
+                return result
+            from tensorflow.python.trackable import converter as _tconv2
+            for name, ref in pairs:
+                try:
+                    ref = _tconv2.convert_to_trackable(ref, parent=obj)
+                except AttributeError:
+                    ref = None
+                if ref is not None:
+                    result[name] = ref
+            return result
+
+        _tv.ObjectGraphView.children = _safe_children
     except Exception:
         pass
 
