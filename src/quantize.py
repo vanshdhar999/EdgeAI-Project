@@ -44,28 +44,66 @@ import tensorflow as tf
 import keras
 
 # ---------------------------------------------------------------------------
-# Python 3.12 + TF _DictWrapper compatibility patch (see train.py for details)
+# Compatibility patches: Python 3.12 + Keras 3 + TF 2.16
 # ---------------------------------------------------------------------------
-def _apply_python312_tf_patch() -> None:
+def _apply_compat_patches() -> None:
+    """
+    Two targeted patches for Python 3.12 + Keras 3 running against TF 2.16.
+
+    Patch 1 — inspect._check_instance (Python 3.12 only):
+      Python 3.12 tightened inspect.getattr_static() so it raises TypeError on
+      objects whose __dict__ descriptor is non-standard (e.g. TF's _DictWrapper).
+      This propagates through typing.__instancecheck__ and breaks isinstance()
+      checks inside TF. Patching _check_instance to return {} on TypeError
+      lets isinstance() complete normally without skipping any serialization logic.
+
+    Patch 2 — Converter.convert_to_trackable (Keras 3 + TF 2.16):
+      Keras 3 stores some model attributes as plain Python dicts rather than
+      the Keras 2 DictWrapper (a Trackable subclass). When tf.saved_model.save()
+      and model.export() traverse the Trackable object graph they call
+      converter.convert_to_trackable(ref) on each child. If ref is a plain dict
+      the function reaches `obj.dtype not in (...)` and crashes:
+        AttributeError: 'dict' object has no attribute 'dtype'
+      Returning None for any ref that raises AttributeError correctly signals
+      "not a trackable object, skip it". Actual trainable variables are always
+      reached through the proper Trackable Layer hierarchy, so nothing is lost.
+    """
     import sys
-    if sys.version_info < (3, 12):
-        return
     import inspect
+
+    # Patch 1 — Python 3.12 + TF inspect issue
+    if sys.version_info >= (3, 12):
+        try:
+            _orig_check = inspect._check_instance
+
+            def _safe_check_instance(obj, attr):
+                try:
+                    return _orig_check(obj, attr)
+                except TypeError:
+                    return {}
+
+            inspect._check_instance = _safe_check_instance
+        except Exception:
+            pass
+
+    # Patch 2 — Keras 3 dict attributes in Trackable graph traversal
     try:
-        _orig = inspect._check_instance
+        from tensorflow.python.trackable import converter as _tconv
 
-        def _safe_check_instance(obj, attr):
+        _orig_ctt = _tconv.Converter.convert_to_trackable
+
+        def _safe_convert_to_trackable(self, ref, parent=None):
             try:
-                return _orig(obj, attr)
-            except TypeError:
-                return {}
+                return _orig_ctt(self, ref, parent=parent)
+            except AttributeError:
+                return None  # Skip plain dicts and other non-Tensor/Trackable objects
 
-        inspect._check_instance = _safe_check_instance
+        _tconv.Converter.convert_to_trackable = _safe_convert_to_trackable
     except Exception:
         pass
 
 
-_apply_python312_tf_patch()
+_apply_compat_patches()
 
 # ---------------------------------------------------------------------------
 # Config

@@ -27,31 +27,44 @@ from augmentation import normalize, build_augmentation_pipeline
 # ---------------------------------------------------------------------------
 # Python 3.12 + TF compatibility patch
 # ---------------------------------------------------------------------------
-# Python 3.12 tightened inspect.getattr_static() so it raises TypeError on
-# objects whose __dict__ descriptor is non-standard (e.g. TF's _DictWrapper).
-# Patching inspect._check_instance (the exact callsite) to return {} on
-# TypeError lets isinstance() complete normally — _DictWrapper correctly
-# resolves to False without bypassing TF's variable serialization logic.
-def _apply_python312_tf_patch() -> None:
+# Compatibility patches: Python 3.12 + Keras 3 + TF 2.16
+# (see quantize.py for full explanation)
+# ---------------------------------------------------------------------------
+def _apply_compat_patches() -> None:
     import sys
-    if sys.version_info < (3, 12):
-        return
     import inspect
+
+    if sys.version_info >= (3, 12):
+        try:
+            _orig_check = inspect._check_instance
+
+            def _safe_check_instance(obj, attr):
+                try:
+                    return _orig_check(obj, attr)
+                except TypeError:
+                    return {}
+
+            inspect._check_instance = _safe_check_instance
+        except Exception:
+            pass
+
     try:
-        _orig = inspect._check_instance
+        from tensorflow.python.trackable import converter as _tconv
 
-        def _safe_check_instance(obj, attr):
+        _orig_ctt = _tconv.Converter.convert_to_trackable
+
+        def _safe_convert_to_trackable(self, ref, parent=None):
             try:
-                return _orig(obj, attr)
-            except TypeError:
-                return {}
+                return _orig_ctt(self, ref, parent=parent)
+            except AttributeError:
+                return None
 
-        inspect._check_instance = _safe_check_instance
+        _tconv.Converter.convert_to_trackable = _safe_convert_to_trackable
     except Exception:
         pass
 
 
-_apply_python312_tf_patch()
+_apply_compat_patches()
 
 
 # ---------------------------------------------------------------------------
