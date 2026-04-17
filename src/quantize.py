@@ -182,6 +182,25 @@ def make_representative_dataset(calibration_images: list[np.ndarray]):
 # Conversion
 # ---------------------------------------------------------------------------
 
+def _trace_model(source: keras.Model) -> "tf.types.experimental.ConcreteFunction":
+    """
+    Trace the model into a concrete TF function with a fixed batch-1 input.
+
+    TFLiteConverter.from_keras_model() relies on a Keras 2 internal hook
+    (keras_deps.get_call_context_function) that Keras 3 removed — calling it
+    returns None and crashes with 'NoneType object is not callable'.
+    from_concrete_functions() bypasses that hook entirely and traces the graph
+    directly, which is compatible with both Keras 2 and Keras 3.
+    """
+    @tf.function(input_signature=[
+        tf.TensorSpec(shape=[1, IMAGE_SIZE[0], IMAGE_SIZE[1], 3], dtype=tf.float32)
+    ])
+    def serving(x: tf.Tensor) -> tf.Tensor:
+        return source(x, training=False)
+
+    return serving.get_concrete_function()
+
+
 def convert_to_tflite_float32(source: keras.Model) -> bytes:
     """
     Convert the trained model to a float32 TFLite model (unquantized baseline).
@@ -192,7 +211,8 @@ def convert_to_tflite_float32(source: keras.Model) -> bytes:
     Returns:
         Serialised TFLite flatbuffer bytes.
     """
-    converter = tf.lite.TFLiteConverter.from_keras_model(source)
+    cf = _trace_model(source)
+    converter = tf.lite.TFLiteConverter.from_concrete_functions([cf], source)
     return converter.convert()
 
 
@@ -214,7 +234,8 @@ def convert_to_tflite_int8(source: keras.Model, calibration_images: list[np.ndar
     Returns:
         Serialised TFLite flatbuffer bytes.
     """
-    converter = tf.lite.TFLiteConverter.from_keras_model(source)
+    cf = _trace_model(source)
+    converter = tf.lite.TFLiteConverter.from_concrete_functions([cf], source)
 
     # Enable post-training integer quantization
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
