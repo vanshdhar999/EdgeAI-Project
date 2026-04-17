@@ -5,11 +5,14 @@ Converts the trained .keras checkpoint to two TFLite variants:
   1. Float32 baseline  → models/plant_disease_float32.tflite
   2. INT8 quantized    → models/plant_disease.tflite  (final deployment model)
 
-We load from the .keras checkpoint (not the SavedModel) because tf.saved_model.save()
-with the Python 3.12 patch can produce a SavedModel with missing ReadVariableOp
-'value' attributes, which causes TFLiteConverter's MLIR frontend to abort.
-TFLiteConverter.from_keras_model() traces the model live from weights and avoids
-this issue entirely.
+Conversion path: .keras checkpoint → temporary SavedModel → TFLite.
+TFLiteConverter.from_saved_model() is the canonical conversion path and
+correctly names all tensors so calibration statistics can be matched to
+the right ops. from_keras_model() was removed: it relies on a Keras 2
+internal hook (keras_deps.get_call_context_function) that Keras 3 removed.
+from_concrete_functions() was removed: it produces tensors with generated
+names that TFLite's calibrator cannot match, causing silent calibration
+failure and completely wrong INT8 activation ranges.
 
 INT8 quantization uses a representative dataset of 200 training-set images to
 calibrate activation ranges.  Float32 I/O is preserved so inference.py and
@@ -28,7 +31,9 @@ Requirements:
     tensorflow>=2.18.0  (same env used for training)
 """
 
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -100,13 +105,6 @@ def load_class_names(labels_path: Path) -> list[str]:
 def load_source_model() -> tuple[keras.Model, str]:
     """
     Load the trained Keras model from a .keras checkpoint.
-
-    Always loads from .keras (not SavedModel): tf.saved_model.save() with the
-    Python 3.12 _DictWrapper patch can produce a SavedModel missing ReadVariableOp
-    'value' attributes, which causes TFLiteConverter's MLIR frontend to abort with
-    "LLVM ERROR: Failed to infer result type(s)".  Loading from .keras and using
-    TFLiteConverter.from_keras_model() traces the graph live from weights, avoiding
-    the corrupted protobuf entirely.
 
     Returns:
         (keras_model, source_description)
@@ -182,43 +180,49 @@ def make_representative_dataset(calibration_images: list[np.ndarray]):
 # Conversion
 # ---------------------------------------------------------------------------
 
-def _trace_model(source: keras.Model) -> "tf.types.experimental.ConcreteFunction":
+def save_temp_savedmodel(source: keras.Model) -> Path:
     """
-    Trace the model into a concrete TF function with a fixed batch-1 input.
+    Serialize the Keras model to a temporary SavedModel directory.
 
-    TFLiteConverter.from_keras_model() relies on a Keras 2 internal hook
-    (keras_deps.get_call_context_function) that Keras 3 removed — calling it
-    returns None and crashes with 'NoneType object is not callable'.
-    from_concrete_functions() bypasses that hook entirely and traces the graph
-    directly, which is compatible with both Keras 2 and Keras 3.
+    from_saved_model() is the canonical TFLite conversion path: tensor names
+    in the SavedModel match what TFLite's calibrator expects, so representative
+    dataset samples are correctly attributed to input ops. Alternatives fail:
+    - from_keras_model(): removed internal Keras 2 hook crashes in Keras 3
+    - from_concrete_functions(): auto-generated tensor names break calibration,
+      causing silent zero-statistics and completely wrong INT8 activation ranges
+
+    The inspect._check_instance patch applied at module load ensures that Python
+    3.12's stricter getattr_static() does not raise TypeError on _DictWrapper,
+    so all conv/dense weights are captured correctly in the SavedModel.
+
+    Returns:
+        Path to the temporary SavedModel directory (caller must delete it).
     """
-    @tf.function(input_signature=[
-        tf.TensorSpec(shape=[1, IMAGE_SIZE[0], IMAGE_SIZE[1], 3], dtype=tf.float32)
-    ])
-    def serving(x: tf.Tensor) -> tf.Tensor:
-        return source(x, training=False)
-
-    return serving.get_concrete_function()
+    tmp_dir = Path(tempfile.mkdtemp(prefix="tflite_export_"))
+    tf.saved_model.save(source, str(tmp_dir))
+    return tmp_dir
 
 
-def convert_to_tflite_float32(source: keras.Model) -> bytes:
+def convert_to_tflite_float32(savedmodel_dir: Path) -> bytes:
     """
-    Convert the trained model to a float32 TFLite model (unquantized baseline).
+    Convert a SavedModel to a float32 TFLite model (unquantized baseline).
 
     Args:
-        source: Loaded keras.Model.
+        savedmodel_dir: Path to a SavedModel directory produced by save_temp_savedmodel().
 
     Returns:
         Serialised TFLite flatbuffer bytes.
     """
-    cf = _trace_model(source)
-    converter = tf.lite.TFLiteConverter.from_concrete_functions([cf], source)
+    converter = tf.lite.TFLiteConverter.from_saved_model(str(savedmodel_dir))
     return converter.convert()
 
 
-def convert_to_tflite_int8(source: keras.Model, calibration_images: list[np.ndarray]) -> bytes:
+def convert_to_tflite_int8(
+    savedmodel_dir: Path,
+    calibration_images: list[np.ndarray],
+) -> bytes:
     """
-    Convert the trained model to an INT8 post-training quantized TFLite model.
+    Convert a SavedModel to an INT8 post-training quantized TFLite model.
 
     Quantization strategy:
     - Weights and activations are quantized to INT8.
@@ -228,14 +232,13 @@ def convert_to_tflite_int8(source: keras.Model, calibration_images: list[np.ndar
       determine per-layer activation ranges.
 
     Args:
-        source:             Loaded keras.Model.
+        savedmodel_dir:     Path to a SavedModel directory.
         calibration_images: Pre-collected calibration images (float32, [0, 1]).
 
     Returns:
         Serialised TFLite flatbuffer bytes.
     """
-    cf = _trace_model(source)
-    converter = tf.lite.TFLiteConverter.from_concrete_functions([cf], source)
+    converter = tf.lite.TFLiteConverter.from_saved_model(str(savedmodel_dir))
 
     # Enable post-training integer quantization
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
@@ -325,21 +328,24 @@ def validate_outputs(
 
 def evaluate_tflite_accuracy(
     tflite_bytes: bytes,
-    class_names: list[str],
     split: str = "test",
     max_images: int = 500,
-) -> float:
+) -> tuple[float, list[str]]:
     """
     Run the TFLite model on a subset of the test split and return top-1 accuracy.
 
+    Class ordering is derived from the split directory (alphabetical sort),
+    which matches image_dataset_from_directory's default ordering used during
+    training. Using labels.txt ordering would be wrong if the file was written
+    in a different order than the model's output indices.
+
     Args:
         tflite_bytes: Serialised TFLite model.
-        class_names:  Ordered class list (from labels.txt).
         split:        Which data split to evaluate on ("test" or "val").
         max_images:   Cap total images to keep evaluation fast on CPU.
 
     Returns:
-        Top-1 accuracy as a float in [0, 1].
+        (top-1 accuracy in [0, 1], alphabetically-sorted class names used)
     """
     from PIL import Image
 
@@ -349,15 +355,17 @@ def evaluate_tflite_accuracy(
     out_details = interp.get_output_details()
 
     split_dir = PROJECT_ROOT / "data" / "processed" / split
+
+    # Alphabetical sort — matches keras image_dataset_from_directory default
+    class_names = sorted(d.name for d in split_dir.iterdir() if d.is_dir())
+
     correct = 0
     total = 0
+    per_class_limit = max(1, max_images // len(class_names))
 
     for class_idx, class_name in enumerate(class_names):
         cls_dir = split_dir / class_name
-        if not cls_dir.exists():
-            continue
         img_paths = sorted(cls_dir.glob("*.jpg"))
-        per_class_limit = max(1, max_images // len(class_names))
 
         for path in img_paths[:per_class_limit]:
             with Image.open(path) as img:
@@ -375,7 +383,7 @@ def evaluate_tflite_accuracy(
                 correct += 1
             total += 1
 
-    return correct / total if total > 0 else 0.0
+    return (correct / total if total > 0 else 0.0), class_names
 
 
 # ---------------------------------------------------------------------------
@@ -385,56 +393,70 @@ def evaluate_tflite_accuracy(
 def quantize() -> None:
     """
     Full Phase 3 quantization pipeline:
-      1. Load trained model.
-      2. Convert to float32 TFLite (baseline).
+      1. Load trained model and export to a temporary SavedModel.
+      2. Convert to float32 TFLite (baseline) and evaluate accuracy.
       3. Collect calibration images from training set.
-      4. Convert to INT8 TFLite with PTQ.
+      4. Convert to INT8 TFLite with PTQ and evaluate accuracy.
       5. Validate INT8 outputs match reference model.
-      6. Evaluate INT8 accuracy on test split.
-      7. Print size and accuracy comparison summary.
+      6. Print size and accuracy comparison summary.
     """
     print("=== Phase 3: TFLite Quantization ===\n")
 
     class_names = load_class_names(LABELS_FILE)
-    print(f"Classes ({len(class_names)}): {class_names}\n")
+    print(f"Classes from labels.txt ({len(class_names)}): {class_names}\n")
 
     # ------------------------------------------------------------------
-    # 1. Load source model
+    # 1. Load source model + export to temporary SavedModel
     # ------------------------------------------------------------------
-    print("Step 1: Loading trained model...")
+    print("Step 1: Loading trained model and exporting to SavedModel...")
     source, source_desc = load_source_model()
-    print(f"  Source: {source_desc}\n")
+    print(f"  Source: {source_desc}")
+    print("  Saving to temporary SavedModel for TFLite conversion...")
+    tmp_savedmodel = save_temp_savedmodel(source)
+    print(f"  SavedModel written to: {tmp_savedmodel}\n")
 
-    # ------------------------------------------------------------------
-    # 2. Float32 TFLite baseline
-    # ------------------------------------------------------------------
-    print("Step 2: Converting to float32 TFLite (baseline)...")
-    t0 = time.time()
-    float32_bytes = convert_to_tflite_float32(source)
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    TFLITE_FLOAT32.write_bytes(float32_bytes)
-    float32_size_mb = len(float32_bytes) / 1024 / 1024
-    print(f"  Saved: {TFLITE_FLOAT32}  ({float32_size_mb:.2f} MB)  "
-          f"[{time.time()-t0:.1f}s]\n")
 
-    # ------------------------------------------------------------------
-    # 3. Collect calibration images
-    # ------------------------------------------------------------------
-    print("Step 3: Collecting calibration images...")
-    calibration_images = collect_calibration_images(NUM_CALIBRATION_SAMPLES)
-    print()
+    try:
+        # ------------------------------------------------------------------
+        # 2. Float32 TFLite baseline + accuracy
+        # ------------------------------------------------------------------
+        print("Step 2: Converting to float32 TFLite (baseline)...")
+        t0 = time.time()
+        float32_bytes = convert_to_tflite_float32(tmp_savedmodel)
+        TFLITE_FLOAT32.write_bytes(float32_bytes)
+        float32_size_mb = len(float32_bytes) / 1024 / 1024
+        print(f"  Saved: {TFLITE_FLOAT32}  ({float32_size_mb:.2f} MB)  "
+              f"[{time.time()-t0:.1f}s]")
+        print("  Evaluating float32 accuracy on test split...")
+        float32_acc, eval_class_names = evaluate_tflite_accuracy(float32_bytes)
+        print(f"  Float32 test accuracy: {float32_acc*100:.2f}%")
+        print(f"  (Class order used for eval: {eval_class_names})\n")
 
-    # ------------------------------------------------------------------
-    # 4. INT8 TFLite quantization
-    # ------------------------------------------------------------------
-    print("Step 4: Converting to INT8 TFLite (post-training quantization)...")
-    print("  This may take a few minutes on CPU...")
-    t0 = time.time()
-    int8_bytes = convert_to_tflite_int8(source, calibration_images)
-    TFLITE_INT8.write_bytes(int8_bytes)
-    int8_size_mb = len(int8_bytes) / 1024 / 1024
-    print(f"  Saved: {TFLITE_INT8}  ({int8_size_mb:.2f} MB)  "
-          f"[{time.time()-t0:.1f}s]\n")
+        # ------------------------------------------------------------------
+        # 3. Collect calibration images
+        # ------------------------------------------------------------------
+        print("Step 3: Collecting calibration images...")
+        calibration_images = collect_calibration_images(NUM_CALIBRATION_SAMPLES)
+        print()
+
+        # ------------------------------------------------------------------
+        # 4. INT8 TFLite quantization + accuracy
+        # ------------------------------------------------------------------
+        print("Step 4: Converting to INT8 TFLite (post-training quantization)...")
+        print("  This may take a few minutes on CPU...")
+        t0 = time.time()
+        int8_bytes = convert_to_tflite_int8(tmp_savedmodel, calibration_images)
+        TFLITE_INT8.write_bytes(int8_bytes)
+        int8_size_mb = len(int8_bytes) / 1024 / 1024
+        print(f"  Saved: {TFLITE_INT8}  ({int8_size_mb:.2f} MB)  "
+              f"[{time.time()-t0:.1f}s]")
+        print("  Evaluating INT8 accuracy on test split...")
+        int8_acc, _ = evaluate_tflite_accuracy(int8_bytes)
+        print(f"  INT8 test accuracy: {int8_acc*100:.2f}%\n")
+
+    finally:
+        shutil.rmtree(tmp_savedmodel, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # 5. Validate INT8 outputs against reference
@@ -444,26 +466,21 @@ def quantize() -> None:
     print()
 
     # ------------------------------------------------------------------
-    # 6. Evaluate INT8 accuracy on test split
+    # 6. Summary
     # ------------------------------------------------------------------
-    print("Step 6: Evaluating INT8 model accuracy on test split...")
-    int8_acc = evaluate_tflite_accuracy(int8_bytes, class_names)
-    print(f"  INT8 test accuracy: {int8_acc*100:.2f}%\n")
-
-    # ------------------------------------------------------------------
-    # 7. Summary
-    # ------------------------------------------------------------------
+    acc_drop = (float32_acc - int8_acc) * 100
     size_reduction = float32_size_mb / int8_size_mb if int8_size_mb > 0 else 0
     print("=== Quantization Summary ===")
     print(f"  Float32 model size : {float32_size_mb:.2f} MB  →  {TFLITE_FLOAT32.name}")
     print(f"  INT8 model size    : {int8_size_mb:.2f} MB  →  {TFLITE_INT8.name}")
     print(f"  Size reduction     : {size_reduction:.1f}x")
-    print(f"  INT8 accuracy      : {int8_acc*100:.2f}%")
+    print(f"  Float32 accuracy   : {float32_acc*100:.2f}%")
+    print(f"  INT8 accuracy      : {int8_acc*100:.2f}%  (drop: {acc_drop:.2f}pp)")
     print(f"  Output validation  : {'PASSED' if valid else 'FAILED'}")
     print(f"\n  Deploy {TFLITE_INT8.name} to the Raspberry Pi for Phase 4.\n")
 
     if int8_size_mb > 10:
-        print(f"  ⚠  INT8 model ({int8_size_mb:.1f} MB) exceeds 10 MB target. "
+        print(f"  WARNING: INT8 model ({int8_size_mb:.1f} MB) exceeds 10 MB target. "
               "Consider reducing IMAGE_SIZE or using a smaller base model.\n")
 
 
