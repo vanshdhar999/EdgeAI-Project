@@ -182,6 +182,7 @@ def quantize_to_int8(
     calibration_images: list[np.ndarray],
 ) -> None:
     """Apply INT8 static quantization to the ONNX float32 model."""
+    import onnx
     from onnxruntime.quantization import (
         quantize_static,
         QuantType,
@@ -194,9 +195,18 @@ def quantize_to_int8(
     print("  Pre-processing ONNX graph for quantization...")
     quant_pre_process(str(float32_onnx_path), str(ONNX_PREPROCESSED), skip_optimization=False)
 
+    # quant_pre_process can rename the input tensor (e.g. "input" → "input.1").
+    # Read the actual name from the preprocessed model so calibration data is
+    # delivered under the correct key — wrong key = zero calibration stats =
+    # all activation ranges collapse = model always predicts the same class.
+    preprocessed_model = onnx.load(str(ONNX_PREPROCESSED))
+    actual_input_name = preprocessed_model.graph.input[0].name
+    print(f"  Preprocessed model input name: '{actual_input_name}'")
+
     class _Reader(CalibrationDataReader):
-        def __init__(self, images):
+        def __init__(self, images, inp_name):
             self._images = images
+            self._inp_name = inp_name
             self._index = 0
 
         def get_next(self):
@@ -204,17 +214,17 @@ def quantize_to_int8(
                 return None
             img = self._images[self._index][np.newaxis, ...]
             self._index += 1
-            return {"input": img}
+            return {self._inp_name: img}
 
-    reader = _Reader(calibration_images)
+    reader = _Reader(calibration_images, actual_input_name)
 
     print("  Running static INT8 quantization (this may take a minute)...")
     quantize_static(
         model_input=str(ONNX_PREPROCESSED),
         model_output=str(int8_onnx_path),
         calibration_data_reader=reader,
-        quant_format=QuantFormat.QOperator,   # replaces ops in-place; QDQ breaks MobileNetV3 Hardswish
-        activation_type=QuantType.QUInt8,     # unsigned 0-255, correct for non-negative activations
+        quant_format=QuantFormat.QOperator,
+        activation_type=QuantType.QUInt8,
         weight_type=QuantType.QInt8,
     )
 
