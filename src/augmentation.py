@@ -1,170 +1,118 @@
 """
 augmentation.py — Augmentation pipeline for plant disease detection training.
 
-Defines a TensorFlow tf.data-compatible augmentation pipeline that simulates
+Defines a torchvision-compatible augmentation pipeline that simulates
 real-world field conditions: varied lighting, camera angle, and leaf orientation.
 
-All augmentations operate on float32 tensors in [0, 1] range.
+All augmentations operate on PIL Images (before ToTensor) or tensors
+normalised with ImageNet mean/std.
 
 Usage (from train.py):
-    from src.augmentation import build_augmentation_pipeline
-    augment_fn = build_augmentation_pipeline()
-    train_ds = train_ds.map(lambda x, y: (augment_fn(x), y))
+    from augmentation import build_train_transform, build_val_transform
+    train_dataset = ImageFolder(root=..., transform=build_train_transform())
+    val_dataset   = ImageFolder(root=..., transform=build_val_transform())
 """
 
-import tensorflow as tf
+from torchvision import transforms
 
+# ---------------------------------------------------------------------------
+# Normalisation constants (ImageNet statistics — matches pretrained weights)
+# ---------------------------------------------------------------------------
+
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+IMAGE_SIZE = (224, 224)
 
 # ---------------------------------------------------------------------------
 # Augmentation parameters
 # ---------------------------------------------------------------------------
 
-# Rotation range in radians (~±30 degrees)
-ROTATION_FACTOR = 0.083   # 30/360
-
-# Brightness and contrast jitter range
-BRIGHTNESS_DELTA = 0.2
-CONTRAST_LOWER   = 0.7
-CONTRAST_UPPER   = 1.3
-
-# Zoom range: fraction of total dimension to crop
-ZOOM_FACTOR = 0.1
-
-# Gaussian noise standard deviation
-NOISE_STDDEV = 0.02
+ROTATION_DEGREES  = 30
+BRIGHTNESS_FACTOR = 0.2
+CONTRAST_FACTOR   = 0.3
+ZOOM_SCALE        = (0.9, 1.0)   # random crop range as fraction of image
 
 
 # ---------------------------------------------------------------------------
-# Individual augmentation ops
+# Transform builders
 # ---------------------------------------------------------------------------
 
-def random_flip(image: tf.Tensor) -> tf.Tensor:
-    """Apply random horizontal and vertical flips."""
-    image = tf.image.random_flip_left_right(image)
-    image = tf.image.random_flip_up_down(image)
-    return image
-
-
-def random_rotation(image: tf.Tensor) -> tf.Tensor:
+def build_train_transform() -> transforms.Compose:
     """
-    Rotate image by a random angle in [-30°, +30°].
+    Build the training augmentation + normalisation pipeline.
 
-    NOTE: This standalone function is kept for reference but should NOT be
-    called inside tf.data.map() — doing so re-instantiates the Keras layer on
-    every image, breaking graph tracing.  Use build_augmentation_pipeline()
-    instead, which creates the layer once and reuses it across all images.
-    """
-    rotator = tf.keras.layers.RandomRotation(
-        factor=ROTATION_FACTOR,
-        fill_mode="reflect",
-        interpolation="bilinear",
-    )
-    image = rotator(tf.expand_dims(image, 0), training=True)
-    return tf.squeeze(image, 0)
-
-
-def random_brightness_contrast(image: tf.Tensor) -> tf.Tensor:
-    """Apply random brightness delta and contrast scaling."""
-    image = tf.image.random_brightness(image, max_delta=BRIGHTNESS_DELTA)
-    image = tf.image.random_contrast(image, lower=CONTRAST_LOWER, upper=CONTRAST_UPPER)
-    return tf.clip_by_value(image, 0.0, 1.0)
-
-
-def random_zoom(image: tf.Tensor, target_size: tuple[int, int] = (224, 224)) -> tf.Tensor:
-    """
-    Randomly zoom in by cropping a central region then resizing back.
-    Simulates variable camera distance from the leaf.
-    """
-    h, w = target_size
-    # Choose a crop size between (1-zoom_factor)*full and full size
-    min_crop = int(h * (1.0 - ZOOM_FACTOR))
-    crop_size = tf.random.uniform((), minval=min_crop, maxval=h, dtype=tf.int32)
-    image = tf.image.random_crop(image, size=[crop_size, crop_size, 3])
-    image = tf.image.resize(image, [h, w], method="bilinear")
-    return image
-
-
-def random_gaussian_noise(image: tf.Tensor) -> tf.Tensor:
-    """Add zero-mean Gaussian noise to simulate sensor noise."""
-    noise = tf.random.normal(shape=tf.shape(image), mean=0.0, stddev=NOISE_STDDEV)
-    return tf.clip_by_value(image + noise, 0.0, 1.0)
-
-
-# ---------------------------------------------------------------------------
-# Pipeline builder
-# ---------------------------------------------------------------------------
-
-def build_augmentation_pipeline(
-    use_rotation: bool = True,
-    use_zoom: bool = True,
-    use_noise: bool = False,
-    target_size: tuple[int, int] = (224, 224),
-) -> callable:
-    """
-    Build and return a single augmentation function suitable for tf.data.map().
-
-    The RandomRotation Keras layer is instantiated ONCE here (not inside the
-    returned closure) so that graph tracing works correctly when this function
-    is used inside tf.map_fn or tf.data.Dataset.map().  Instantiating Keras
-    preprocessing layers per image breaks graph tracing and reproducibility.
-
-    Args:
-        use_rotation: Apply random ±30° rotation (default True).
-        use_zoom:     Apply random zoom crop (default True).
-        use_noise:    Apply Gaussian noise (default False — off by default
-                      to keep training stable; enable for extra robustness).
-        target_size:  (H, W) of output images.
+    Operations applied in order:
+      1. Random horizontal and vertical flip
+      2. Random rotation ±30°
+      3. Random resized crop (simulates zoom)
+      4. Brightness and contrast jitter
+      5. ToTensor (HWC uint8 → CHW float32 [0, 1])
+      6. ImageNet normalisation
 
     Returns:
-        A callable that takes a float32 image tensor [H, W, 3] in [0,1]
-        and returns an augmented tensor of the same shape.
+        torchvision.transforms.Compose for training data.
     """
-    # Instantiate the rotation layer once here so it is shared across all
-    # images in the tf.data pipeline, avoiding repeated layer creation that
-    # breaks TF graph tracing.
-    rotator = tf.keras.layers.RandomRotation(
-        factor=ROTATION_FACTOR, fill_mode="reflect", interpolation="bilinear"
-    )
-
-    def augment(image: tf.Tensor) -> tf.Tensor:
-        image = random_flip(image)
-        image = random_brightness_contrast(image)
-        if use_rotation:
-            image = tf.squeeze(rotator(tf.expand_dims(image, 0), training=True), 0)
-        if use_zoom:
-            image = random_zoom(image, target_size=target_size)
-        if use_noise:
-            image = random_gaussian_noise(image)
-        return image
-
-    return augment
+    return transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(degrees=ROTATION_DEGREES),
+        transforms.RandomResizedCrop(size=IMAGE_SIZE, scale=ZOOM_SCALE),
+        transforms.ColorJitter(
+            brightness=BRIGHTNESS_FACTOR,
+            contrast=CONTRAST_FACTOR,
+        ),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ])
 
 
-# ---------------------------------------------------------------------------
-# Normalisation helper (used in both training and inference)
-# ---------------------------------------------------------------------------
-
-def normalize(image: tf.Tensor) -> tf.Tensor:
+def build_val_transform() -> transforms.Compose:
     """
-    Scale pixel values from uint8 [0, 255] to float32 [0, 1].
+    Build the validation/test/inference normalisation pipeline (no augmentation).
 
-    CRITICAL: This exact normalisation MUST be replicated in inference.py
-    and live_camera.py. Any mismatch will silently degrade accuracy.
+    Operations applied in order:
+      1. Resize to IMAGE_SIZE
+      2. ToTensor (HWC uint8 → CHW float32 [0, 1])
+      3. ImageNet normalisation
+
+    Returns:
+        torchvision.transforms.Compose for validation/test/inference data.
     """
-    return tf.cast(image, tf.float32) / 255.0
+    return transforms.Compose([
+        transforms.Resize(IMAGE_SIZE),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ])
 
 
-def preprocess_for_inference(image: tf.Tensor, target_size: tuple[int, int] = (224, 224)) -> tf.Tensor:
+def preprocess_for_inference(image_array, target_size: tuple[int, int] = IMAGE_SIZE):
     """
-    Resize and normalise a single image for TFLite inference.
+    Preprocess a numpy uint8 HWC image (H, W, 3) for ONNX Runtime inference.
+
+    CRITICAL: This must exactly match the val_transform pipeline used during
+    training. Any mismatch will silently degrade inference accuracy.
 
     Args:
-        image: uint8 or float tensor of any spatial size, 3 channels.
+        image_array: numpy array, shape (H, W, 3), dtype uint8, values 0-255.
         target_size: (H, W) the model expects.
 
     Returns:
-        float32 tensor [1, H, W, 3] in [0, 1], with batch dimension added.
+        numpy float32 array of shape (1, 3, H, W) — batch dimension + NCHW.
     """
-    image = tf.image.resize(image, target_size, method="bilinear")
-    image = normalize(image)
-    return tf.expand_dims(image, 0)
+    import cv2
+    import numpy as np
+
+    # Resize to model input size
+    resized = cv2.resize(image_array, (target_size[1], target_size[0]))
+
+    # HWC uint8 → CHW float32 [0, 1]
+    arr = resized.astype(np.float32) / 255.0
+    arr = arr.transpose(2, 0, 1)  # HWC → CHW
+
+    # ImageNet normalisation
+    mean = np.array(IMAGENET_MEAN, dtype=np.float32).reshape(3, 1, 1)
+    std  = np.array(IMAGENET_STD,  dtype=np.float32).reshape(3, 1, 1)
+    arr  = (arr - mean) / std
+
+    return arr[np.newaxis, ...]  # add batch dimension: (1, 3, H, W)

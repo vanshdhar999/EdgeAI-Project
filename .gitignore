@@ -3,6 +3,7 @@ data/processed/
 data/augmented/
 models/checkpoints/
 *.h5
+models/_preprocessed_for_quant.onnx
 __pycache__/
 .env
 *.pyc

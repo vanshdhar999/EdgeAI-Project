@@ -1,177 +1,37 @@
 """
-quantize.py — INT8 post-training quantization and TFLite export.
+quantize.py — INT8 post-training quantization and ONNX export.
 
-Converts the trained .keras checkpoint to two TFLite variants:
-  1. Float32 baseline  → models/plant_disease_float32.tflite
-  2. INT8 quantized    → models/plant_disease.tflite  (final deployment model)
+Converts the trained PyTorch checkpoint to two ONNX variants:
+  1. Float32 baseline  → models/plant_disease_float32.onnx
+  2. INT8 quantized    → models/plant_disease.onnx  (final deployment model)
 
-Conversion path: .keras checkpoint → temporary SavedModel → TFLite.
-TFLiteConverter.from_saved_model() is the canonical conversion path and
-correctly names all tensors so calibration statistics can be matched to
-the right ops. from_keras_model() was removed: it relies on a Keras 2
-internal hook (keras_deps.get_call_context_function) that Keras 3 removed.
-from_concrete_functions() was removed: it produces tensors with generated
-names that TFLite's calibrator cannot match, causing silent calibration
-failure and completely wrong INT8 activation ranges.
+Conversion path: .pt checkpoint → ONNX float32 → ONNX INT8 (via onnxruntime.quantization).
 
-INT8 quantization uses a representative dataset of 200 training-set images to
-calibrate activation ranges.  Float32 I/O is preserved so inference.py and
-live_camera.py can pass normalised float32 images ([0, 1]) without extra
-preprocessing steps.
+INT8 quantization uses static quantization with a representative dataset of
+200 training-set images to calibrate activation ranges.
 
-Usage (on GPU training machine):
-    python3 src/quantize.py
+Usage:
+    conda run -n pydl python3 src/quantize.py
 
 Outputs:
-    models/plant_disease_float32.tflite  — unquantized baseline
-    models/plant_disease.tflite          — INT8 quantized (deploy this)
-    models/labels.txt                    — class names (already present)
+    models/plant_disease_float32.onnx  — unquantized baseline
+    models/plant_disease.onnx          — INT8 quantized (deploy this)
+    models/labels.txt                  — class names (already present)
 
 Requirements:
-    tensorflow>=2.18.0  (same env used for training)
+    torch, torchvision, onnx, onnxruntime (same env as training)
 """
 
-import shutil
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 import numpy as np
-import tensorflow as tf
-import keras
-
-# ---------------------------------------------------------------------------
-# Compatibility patches: Python 3.12 + Keras 3 + TF 2.16
-# ---------------------------------------------------------------------------
-def _apply_compat_patches() -> None:
-    """
-    Two targeted patches for Python 3.12 + Keras 3 running against TF 2.16.
-
-    Patch 1 — inspect._check_instance (Python 3.12 only):
-      Python 3.12 tightened inspect.getattr_static() so it raises TypeError on
-      objects whose __dict__ descriptor is non-standard (e.g. TF's _DictWrapper).
-      This propagates through typing.__instancecheck__ and breaks isinstance()
-      checks inside TF. Patching _check_instance to return {} on TypeError
-      lets isinstance() complete normally without skipping any serialization logic.
-
-    Patch 2 — Converter.convert_to_trackable (Keras 3 + TF 2.16):
-      Keras 3 stores some model attributes as plain Python dicts rather than
-      the Keras 2 DictWrapper (a Trackable subclass). When tf.saved_model.save()
-      and model.export() traverse the Trackable object graph they call
-      converter.convert_to_trackable(ref) on each child. If ref is a plain dict
-      the function reaches `obj.dtype not in (...)` and crashes:
-        AttributeError: 'dict' object has no attribute 'dtype'
-      Returning None for any ref that raises AttributeError correctly signals
-      "not a trackable object, skip it". Actual trainable variables are always
-      reached through the proper Trackable Layer hierarchy, so nothing is lost.
-    """
-    import sys
-    import inspect
-
-    # Patch 1 — Python 3.12 + TF inspect issue
-    if sys.version_info >= (3, 12):
-        try:
-            _orig_check = inspect._check_instance
-
-            def _safe_check_instance(obj, attr):
-                try:
-                    return _orig_check(obj, attr)
-                except TypeError:
-                    return {}
-
-            inspect._check_instance = _safe_check_instance
-        except Exception:
-            pass
-
-    # Patch 2 — Keras 3 dict attributes in Trackable graph traversal
-    #
-    # trackable_view.py calls:  converter.convert_to_trackable(ref, parent=obj)
-    # where `converter` is the tensorflow.python.trackable.converter MODULE.
-    # In TF 2.16 this is a module-level function, NOT a class method — so
-    # patching Converter.convert_to_trackable has no effect on that call path.
-    #
-    # Strategy: patch every possible location where the function lives:
-    #   a) as a module-level function   (_tconv.convert_to_trackable)
-    #   b) as a Converter class method  (_tconv.Converter.convert_to_trackable)
-    # Then also patch the ObjectGraphView.children caller as a belt-and-suspenders
-    # fallback in case neither (a) nor (b) catches the right instance.
-
-    def _make_safe_ctt(fn):
-        """Return a wrapper that returns None on AttributeError ('dict.dtype')."""
-        import functools
-        @functools.wraps(fn)
-        def _wrapper(*args, **kwargs):
-            try:
-                return fn(*args, **kwargs)
-            except AttributeError:
-                return None
-        return _wrapper
-
-    # (a) module-level function
-    try:
-        from tensorflow.python.trackable import converter as _tconv
-        if callable(getattr(_tconv, 'convert_to_trackable', None)):
-            _tconv.convert_to_trackable = _make_safe_ctt(_tconv.convert_to_trackable)
-    except Exception:
-        pass
-
-    # (b) class method on Converter
-    try:
-        from tensorflow.python.trackable import converter as _tconv
-        if hasattr(_tconv, 'Converter') and callable(
-                getattr(_tconv.Converter, 'convert_to_trackable', None)):
-            _tconv.Converter.convert_to_trackable = _make_safe_ctt(
-                _tconv.Converter.convert_to_trackable
-            )
-    except Exception:
-        pass
-
-    # (c) Filter None values out of every children() return value.
-    #
-    # With patch (a)/(b) in place, convert_to_trackable() now returns None for
-    # plain dict refs instead of crashing.  But the original children() code
-    # adds that None directly to its result dict, _descendants_with_paths then
-    # enqueues None into the BFS queue, and the next children(None) call
-    # crashes at obj._maybe_initialize_trackable() (AttributeError on NoneType).
-    #
-    # Fix: wrap every children() defined in the relevant modules so None values
-    # are stripped from the result before it reaches the BFS loop.
-    # We check `cls.__dict__` so we only wrap classes that OWN the method —
-    # this avoids double-wrapping through inheritance and handles whatever class
-    # name TF 2.16 actually uses (it may not be 'ObjectGraphView').
-
-    def _make_children_filter(method):
-        import functools
-        @functools.wraps(method)
-        def _safe_children(self, obj, **kwargs):
-            try:
-                result = method(self, obj, **kwargs)
-            except AttributeError:
-                return {}
-            if isinstance(result, dict):
-                return {k: v for k, v in result.items() if v is not None}
-            return result
-        return _safe_children
-
-    for _module_path in (
-        'tensorflow.python.checkpoint.trackable_view',
-        'keras.src.export.saved_model_export_archive',
-    ):
-        try:
-            import importlib as _il
-            _mod = _il.import_module(_module_path)
-            for _cname in dir(_mod):
-                _cls = getattr(_mod, _cname, None)
-                if isinstance(_cls, type) and 'children' in _cls.__dict__:
-                    _cls.children = _make_children_filter(_cls.children)
-        except Exception:
-            pass
-
-
-_apply_compat_patches()
+import torch
+import torch.nn as nn
+from torchvision import models
 
 # ---------------------------------------------------------------------------
 # Config
@@ -179,20 +39,20 @@ _apply_compat_patches()
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 MODELS_DIR: Path = PROJECT_ROOT / "models"
-SAVEDMODEL_DIR: Path = MODELS_DIR / "plant_disease_savedmodel"
 CHECKPOINT_DIR: Path = MODELS_DIR / "checkpoints"
 LABELS_FILE: Path = MODELS_DIR / "labels.txt"
 DATA_TRAIN_DIR: Path = PROJECT_ROOT / "data" / "processed" / "train"
+DATA_TEST_DIR: Path = PROJECT_ROOT / "data" / "processed" / "test"
 
-# Output TFLite paths
-TFLITE_FLOAT32: Path = MODELS_DIR / "plant_disease_float32.tflite"
-TFLITE_INT8: Path = MODELS_DIR / "plant_disease.tflite"
+ONNX_FLOAT32: Path = MODELS_DIR / "plant_disease_float32.onnx"
+ONNX_INT8: Path = MODELS_DIR / "plant_disease.onnx"
+ONNX_PREPROCESSED: Path = MODELS_DIR / "_preprocessed_for_quant.onnx"
 
-# Number of representative samples for INT8 calibration
 NUM_CALIBRATION_SAMPLES: int = 200
-
-# Model input shape expected by MobileNetV3Small
 IMAGE_SIZE: tuple[int, int] = (224, 224)
+
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +60,6 @@ IMAGE_SIZE: tuple[int, int] = (224, 224)
 # ---------------------------------------------------------------------------
 
 def load_class_names(labels_path: Path) -> list[str]:
-    """Return ordered class names from labels.txt."""
     return [
         line.strip()
         for line in labels_path.read_text(encoding="utf-8").splitlines()
@@ -208,299 +67,258 @@ def load_class_names(labels_path: Path) -> list[str]:
     ]
 
 
-def load_source_model() -> tuple[keras.Model, str]:
-    """
-    Load the trained Keras model from a .keras checkpoint.
+def load_source_model() -> tuple[nn.Module, list[str]]:
+    """Load the best available PyTorch checkpoint."""
+    for ckpt_path in (
+        CHECKPOINT_DIR / "best_stage2.pt",
+        CHECKPOINT_DIR / "best_stage1.pt",
+    ):
+        if ckpt_path.exists():
+            print(f"  Loading checkpoint: {ckpt_path}")
+            ckpt = torch.load(str(ckpt_path), map_location="cpu")
+            class_names = ckpt["class_names"]
+            num_classes = ckpt["num_classes"]
 
-    Returns:
-        (keras_model, source_description)
-    """
-    for ckpt in (CHECKPOINT_DIR / "best_stage1.keras",
-                 CHECKPOINT_DIR / "best_stage2.keras"):
-        if ckpt.exists():
-            print(f"  Loading Keras checkpoint: {ckpt}")
-            model = keras.models.load_model(str(ckpt))
-            return model, f"Keras checkpoint ({ckpt.name})"
+            model = models.mobilenet_v3_small(weights=None)
+            in_features = model.classifier[0].in_features
+            model.classifier = nn.Sequential(
+                nn.Linear(in_features, 128),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.3),
+                nn.Linear(128, num_classes),
+            )
+            model.load_state_dict(ckpt["model_state_dict"])
+            model.eval()
+            return model, class_names
 
     raise FileNotFoundError(
-        "No .keras checkpoint found. Run src/train.py first.\n"
-        f"  Looked for: {CHECKPOINT_DIR / 'best_stage1.keras'}\n"
-        f"             {CHECKPOINT_DIR / 'best_stage2.keras'}"
+        "No .pt checkpoint found. Run src/train.py first.\n"
+        f"  Looked for: {CHECKPOINT_DIR / 'best_stage2.pt'}\n"
+        f"             {CHECKPOINT_DIR / 'best_stage1.pt'}"
     )
+
+
+def preprocess_image(path: Path) -> np.ndarray:
+    """Load, resize, and normalise one image to NCHW float32."""
+    from PIL import Image
+    with Image.open(path) as img:
+        img = img.convert("RGB").resize((IMAGE_SIZE[1], IMAGE_SIZE[0]), Image.LANCZOS)
+        arr = np.array(img, dtype=np.float32) / 255.0  # [0, 1]
+    arr = arr.transpose(2, 0, 1)  # HWC → CHW
+    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
+    return arr.astype(np.float32)  # (3, H, W)
 
 
 def collect_calibration_images(num_samples: int = NUM_CALIBRATION_SAMPLES) -> list[np.ndarray]:
     """
-    Collect a balanced sample of normalised training images for INT8 calibration.
+    Collect a balanced sample of training images for INT8 calibration.
 
-    Samples are drawn proportionally from each class directory so that all
-    disease categories contribute to the activation calibration.
-
-    Args:
-        num_samples: Total number of images to collect.
-
-    Returns:
-        List of float32 numpy arrays, each shaped (224, 224, 3) in [0, 1].
+    Returns list of float32 numpy arrays shaped (3, H, W) — one per image.
     """
-    from PIL import Image
-
-    class_dirs = sorted(
-        d for d in DATA_TRAIN_DIR.iterdir() if d.is_dir()
-    )
+    class_dirs = sorted(d for d in DATA_TRAIN_DIR.iterdir() if d.is_dir())
     if not class_dirs:
-        raise FileNotFoundError(
-            f"No class subdirectories found in {DATA_TRAIN_DIR}. "
-            "Run src/data_prep.py first."
-        )
+        raise FileNotFoundError(f"No class dirs found in {DATA_TRAIN_DIR}. Run data_prep.py.")
 
     per_class = max(1, num_samples // len(class_dirs))
     images: list[np.ndarray] = []
 
     for cls_dir in class_dirs:
-        img_paths = sorted(cls_dir.glob("*.jpg"))[:per_class]
-        for path in img_paths:
-            with Image.open(path) as img:
-                img = img.convert("RGB").resize(IMAGE_SIZE, Image.LANCZOS)
-                arr = np.array(img, dtype=np.float32) / 255.0  # [0, 1]
-                images.append(arr)
+        for path in sorted(cls_dir.glob("*.jpg"))[:per_class]:
+            images.append(preprocess_image(path))
 
-    print(f"  Calibration images collected: {len(images)} "
-          f"(~{len(images) // len(class_dirs)} per class across {len(class_dirs)} classes)")
+    print(
+        f"  Calibration images: {len(images)} "
+        f"(~{len(images) // len(class_dirs)} per class, {len(class_dirs)} classes)"
+    )
     return images
 
 
-def make_representative_dataset(calibration_images: list[np.ndarray]):
-    """
-    Return a generator function compatible with TFLiteConverter.representative_dataset.
+# ---------------------------------------------------------------------------
+# ONNX export
+# ---------------------------------------------------------------------------
 
-    Each call yields a list containing one float32 tensor of shape [1, 224, 224, 3].
-    """
-    def generator():
-        for img in calibration_images:
-            yield [img[np.newaxis, ...].astype(np.float32)]
-
-    return generator
+def export_onnx(model: nn.Module, output_path: Path) -> None:
+    """Export PyTorch model to ONNX float32."""
+    dummy = torch.randn(1, 3, *IMAGE_SIZE)
+    torch.onnx.export(
+        model,
+        dummy,
+        str(output_path),
+        opset_version=17,
+        input_names=["input"],
+        output_names=["output"],
+        dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+    )
+    size_mb = output_path.stat().st_size / 1024 / 1024
+    print(f"  Exported ONNX: {output_path}  ({size_mb:.2f} MB)")
 
 
 # ---------------------------------------------------------------------------
-# Conversion
+# INT8 static quantization
 # ---------------------------------------------------------------------------
 
-def save_temp_savedmodel(source: keras.Model) -> Path:
-    """
-    Serialize the Keras model to a temporary SavedModel directory via Keras 3's
-    model.export() rather than tf.saved_model.save().
+class _CalibrationReader:
+    """CalibrationDataReader compatible with onnxruntime.quantization API."""
 
-    Why not tf.saved_model.save(model, ...):
-      Keras 3 stores some internal attributes as plain Python dicts. When
-      tf.saved_model.save() traverses the Trackable object graph it reaches
-      one of these dicts and calls obj.dtype on it, crashing with:
-        AttributeError: 'dict' object has no attribute 'dtype'
+    def __init__(self, images: list[np.ndarray]):
+        self._images = images
+        self._index = 0
 
-    Why model.export() works:
-      Keras 3's export() wraps the model in an ExportArchive — a clean
-      tf.Module whose Trackable graph is built solely from traced concrete
-      functions and explicitly tracked variables. tf.saved_model.save() is
-      then called on that tf.Module (not the raw Keras model), so it never
-      encounters plain dict attributes.
+    def get_next(self):
+        if self._index >= len(self._images):
+            return None
+        img = self._images[self._index][np.newaxis, ...]  # (1, 3, H, W)
+        self._index += 1
+        return {"input": img}
 
-    Why from_saved_model() is used for TFLite conversion:
-      It is the canonical path and assigns stable tensor names to all ops.
-      TFLite's calibrator matches representative dataset samples to input
-      tensors by name; stable names are required for correct INT8 calibration.
-      from_concrete_functions() produces auto-generated names that the
-      calibrator cannot match, causing silent zero-statistics and wrong
-      INT8 activation ranges.
-
-    Returns:
-        Path to the temporary SavedModel directory (caller must delete it).
-    """
-    tmp_dir = Path(tempfile.mkdtemp(prefix="tflite_export_"))
-    source.export(str(tmp_dir))
-    return tmp_dir
+    def rewind(self):
+        self._index = 0
 
 
-def convert_to_tflite_float32(savedmodel_dir: Path) -> bytes:
-    """
-    Convert a SavedModel to a float32 TFLite model (unquantized baseline).
-
-    Args:
-        savedmodel_dir: Path to a SavedModel directory produced by save_temp_savedmodel().
-
-    Returns:
-        Serialised TFLite flatbuffer bytes.
-    """
-    converter = tf.lite.TFLiteConverter.from_saved_model(str(savedmodel_dir))
-    return converter.convert()
-
-
-def convert_to_tflite_int8(
-    savedmodel_dir: Path,
+def quantize_to_int8(
+    float32_onnx_path: Path,
+    int8_onnx_path: Path,
     calibration_images: list[np.ndarray],
-) -> bytes:
-    """
-    Convert a SavedModel to an INT8 post-training quantized TFLite model.
+) -> None:
+    """Apply INT8 static quantization to the ONNX float32 model."""
+    from onnxruntime.quantization import (
+        quantize_static,
+        QuantType,
+        QuantFormat,
+        quant_pre_process,
+        CalibrationDataReader,
+    )
 
-    Quantization strategy:
-    - Weights and activations are quantized to INT8.
-    - Input and output tensors remain float32 so that inference code can pass
-      normalised [0, 1] images without additional scale/zero-point arithmetic.
-    - Calibration uses NUM_CALIBRATION_SAMPLES images from the training set to
-      determine per-layer activation ranges.
+    # Pre-process: add shape inference info required by the quantizer
+    print("  Pre-processing ONNX graph for quantization...")
+    quant_pre_process(str(float32_onnx_path), str(ONNX_PREPROCESSED), skip_optimization=False)
 
-    Args:
-        savedmodel_dir:     Path to a SavedModel directory.
-        calibration_images: Pre-collected calibration images (float32, [0, 1]).
+    class _Reader(CalibrationDataReader):
+        def __init__(self, images):
+            self._images = images
+            self._index = 0
 
-    Returns:
-        Serialised TFLite flatbuffer bytes.
-    """
-    converter = tf.lite.TFLiteConverter.from_saved_model(str(savedmodel_dir))
+        def get_next(self):
+            if self._index >= len(self._images):
+                return None
+            img = self._images[self._index][np.newaxis, ...]
+            self._index += 1
+            return {"input": img}
 
-    # Enable post-training integer quantization
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    converter.representative_dataset = make_representative_dataset(calibration_images)
+    reader = _Reader(calibration_images)
 
-    # Target: all ops in INT8 on TFLite built-ins
-    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    print("  Running static INT8 quantization (this may take a minute)...")
+    quantize_static(
+        model_input=str(ONNX_PREPROCESSED),
+        model_output=str(int8_onnx_path),
+        calibration_data_reader=reader,
+        quant_format=QuantFormat.QDQ,
+        activation_type=QuantType.QInt8,
+        weight_type=QuantType.QInt8,
+    )
 
-    # Keep float32 I/O so inference.py doesn't need scale/zero-point handling
-    converter.inference_input_type = tf.float32
-    converter.inference_output_type = tf.float32
+    # Clean up temporary preprocessed model
+    ONNX_PREPROCESSED.unlink(missing_ok=True)
 
-    return converter.convert()
-
-
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
-
-def validate_outputs(
-    source: keras.Model,
-    tflite_bytes: bytes,
-    calibration_images: list[np.ndarray],
-    num_checks: int = 10,
-    tolerance: float = 0.05,
-) -> bool:
-    """
-    Verify that TFLite model outputs closely match the Keras model outputs
-    on the same inputs.
-
-    Args:
-        source:             Loaded keras.Model (reference for comparison).
-        tflite_bytes:       INT8 TFLite model bytes.
-        calibration_images: Pool of images to sample from.
-        num_checks:         Number of images to compare.
-        tolerance:          Max allowed absolute difference between top-1 probabilities.
-
-    Returns:
-        True if all checks pass, False otherwise.
-    """
-    def ref_predict(x: np.ndarray) -> np.ndarray:
-        return source.predict(x, verbose=0)
-
-    # Set up TFLite interpreter
-    interp = tf.lite.Interpreter(model_content=tflite_bytes)
-    interp.allocate_tensors()
-    inp_details = interp.get_input_details()
-    out_details = interp.get_output_details()
-
-    mismatches = 0
-    rng = np.random.default_rng(seed=42)
-    indices = rng.choice(len(calibration_images), size=min(num_checks, len(calibration_images)), replace=False)
-
-    for i in indices:
-        img = calibration_images[i][np.newaxis, ...].astype(np.float32)
-
-        # Reference
-        ref_out = ref_predict(img)
-        ref_top1 = int(np.argmax(ref_out[0]))
-        ref_conf = float(ref_out[0][ref_top1])
-
-        # TFLite
-        interp.set_tensor(inp_details[0]["index"], img)
-        interp.invoke()
-        tfl_out = interp.get_tensor(out_details[0]["index"])
-        tfl_top1 = int(np.argmax(tfl_out[0]))
-        tfl_conf = float(tfl_out[0][tfl_top1])
-
-        match = ref_top1 == tfl_top1
-        diff = abs(ref_conf - tfl_conf)
-        status = "✓" if match and diff <= tolerance else "✗"
-        print(f"  [{status}] sample {i:3d}: ref={ref_top1} ({ref_conf:.3f}) "
-              f"tfl={tfl_top1} ({tfl_conf:.3f}) Δconf={diff:.4f}")
-
-        if not (match and diff <= tolerance):
-            mismatches += 1
-
-    passed = num_checks - mismatches
-    print(f"\n  Validation: {passed}/{num_checks} checks passed "
-          f"(tolerance={tolerance:.2f})")
-    return mismatches == 0
+    size_mb = int8_onnx_path.stat().st_size / 1024 / 1024
+    print(f"  Saved INT8 ONNX: {int8_onnx_path}  ({size_mb:.2f} MB)")
 
 
 # ---------------------------------------------------------------------------
-# Accuracy comparison on test set
+# Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_tflite_accuracy(
-    tflite_bytes: bytes,
+def evaluate_onnx_accuracy(
+    onnx_path: Path,
     split: str = "test",
     max_images: int = 500,
 ) -> tuple[float, list[str]]:
     """
-    Run the TFLite model on a subset of the test split and return top-1 accuracy.
+    Evaluate ONNX model top-1 accuracy on a data split.
 
-    Class ordering is derived from the split directory (alphabetical sort),
-    which matches image_dataset_from_directory's default ordering used during
-    training. Using labels.txt ordering would be wrong if the file was written
-    in a different order than the model's output indices.
-
-    Args:
-        tflite_bytes: Serialised TFLite model.
-        split:        Which data split to evaluate on ("test" or "val").
-        max_images:   Cap total images to keep evaluation fast on CPU.
+    Class order is derived from the split directory (alphabetical), which
+    matches ImageFolder's ordering used during training.
 
     Returns:
-        (top-1 accuracy in [0, 1], alphabetically-sorted class names used)
+        (top-1 accuracy in [0, 1], alphabetically-sorted class names)
     """
-    from PIL import Image
+    import onnxruntime as ort
 
-    interp = tf.lite.Interpreter(model_content=tflite_bytes)
-    interp.allocate_tensors()
-    inp_details = interp.get_input_details()
-    out_details = interp.get_output_details()
+    session = ort.InferenceSession(
+        str(onnx_path),
+        providers=["CPUExecutionProvider"],
+    )
+    input_name = session.get_inputs()[0].name
 
     split_dir = PROJECT_ROOT / "data" / "processed" / split
-
-    # Alphabetical sort — matches keras image_dataset_from_directory default
     class_names = sorted(d.name for d in split_dir.iterdir() if d.is_dir())
 
+    per_class = max(1, max_images // len(class_names))
     correct = 0
     total = 0
-    per_class_limit = max(1, max_images // len(class_names))
 
     for class_idx, class_name in enumerate(class_names):
         cls_dir = split_dir / class_name
-        img_paths = sorted(cls_dir.glob("*.jpg"))
-
-        for path in img_paths[:per_class_limit]:
-            with Image.open(path) as img:
-                img_arr = np.array(
-                    img.convert("RGB").resize(IMAGE_SIZE, Image.LANCZOS),
-                    dtype=np.float32,
-                ) / 255.0
-
-            inp = img_arr[np.newaxis, ...]
-            interp.set_tensor(inp_details[0]["index"], inp)
-            interp.invoke()
-            pred = int(np.argmax(interp.get_tensor(out_details[0]["index"])[0]))
-
+        for path in sorted(cls_dir.glob("*.jpg"))[:per_class]:
+            img = preprocess_image(path)[np.newaxis, ...]  # (1, 3, H, W)
+            outputs = session.run(None, {input_name: img})
+            pred = int(np.argmax(outputs[0][0]))
             if pred == class_idx:
                 correct += 1
             total += 1
 
     return (correct / total if total > 0 else 0.0), class_names
+
+
+def validate_outputs(
+    source: nn.Module,
+    onnx_path: Path,
+    calibration_images: list[np.ndarray],
+    num_checks: int = 10,
+    tolerance: float = 0.05,
+) -> bool:
+    """
+    Verify ONNX model outputs closely match PyTorch model outputs.
+
+    Returns True if all top-1 predictions match within confidence tolerance.
+    """
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+
+    rng = np.random.default_rng(seed=42)
+    indices = rng.choice(len(calibration_images), size=min(num_checks, len(calibration_images)), replace=False)
+
+    mismatches = 0
+    with torch.no_grad():
+        for i in indices:
+            img_np = calibration_images[i][np.newaxis, ...].astype(np.float32)
+            img_pt = torch.from_numpy(img_np)
+
+            # PyTorch reference
+            ref_out = source(img_pt).numpy()[0]
+            ref_top1 = int(np.argmax(ref_out))
+            ref_conf = float(ref_out[ref_top1])
+
+            # ONNX
+            ort_out = session.run(None, {input_name: img_np})[0][0]
+            ort_top1 = int(np.argmax(ort_out))
+            ort_conf = float(ort_out[ort_top1])
+
+            match = ref_top1 == ort_top1
+            diff = abs(ref_conf - ort_conf)
+            status = "✓" if match and diff <= tolerance else "✗"
+            print(
+                f"  [{status}] sample {i:3d}: ref={ref_top1} ({ref_conf:.3f})  "
+                f"onnx={ort_top1} ({ort_conf:.3f})  Δconf={diff:.4f}"
+            )
+            if not (match and diff <= tolerance):
+                mismatches += 1
+
+    passed = num_checks - mismatches
+    print(f"\n  Validation: {passed}/{num_checks} checks passed (tolerance={tolerance:.2f})")
+    return mismatches == 0
 
 
 # ---------------------------------------------------------------------------
@@ -509,96 +327,90 @@ def evaluate_tflite_accuracy(
 
 def quantize() -> None:
     """
-    Full Phase 3 quantization pipeline:
-      1. Load trained model and export to a temporary SavedModel.
-      2. Convert to float32 TFLite (baseline) and evaluate accuracy.
-      3. Collect calibration images from training set.
-      4. Convert to INT8 TFLite with PTQ and evaluate accuracy.
-      5. Validate INT8 outputs match reference model.
-      6. Print size and accuracy comparison summary.
+    Full Phase 3 pipeline:
+      1. Load trained PyTorch model and export to ONNX float32.
+      2. Evaluate float32 ONNX accuracy on test split.
+      3. Collect calibration images.
+      4. Apply INT8 static quantization.
+      5. Evaluate INT8 accuracy on test split.
+      6. Validate INT8 outputs against reference.
+      7. Print summary.
     """
-    print("=== Phase 3: TFLite Quantization ===\n")
+    print("=== Phase 3: ONNX Quantization ===\n")
 
     class_names = load_class_names(LABELS_FILE)
-    print(f"Classes from labels.txt ({len(class_names)}): {class_names}\n")
-
-    # ------------------------------------------------------------------
-    # 1. Load source model + export to temporary SavedModel
-    # ------------------------------------------------------------------
-    print("Step 1: Loading trained model and exporting to SavedModel...")
-    source, source_desc = load_source_model()
-    print(f"  Source: {source_desc}")
-    print("  Saving to temporary SavedModel for TFLite conversion...")
-    tmp_savedmodel = save_temp_savedmodel(source)
-    print(f"  SavedModel written to: {tmp_savedmodel}\n")
+    print(f"Classes ({len(class_names)}): {class_names}\n")
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    try:
-        # ------------------------------------------------------------------
-        # 2. Float32 TFLite baseline + accuracy
-        # ------------------------------------------------------------------
-        print("Step 2: Converting to float32 TFLite (baseline)...")
-        t0 = time.time()
-        float32_bytes = convert_to_tflite_float32(tmp_savedmodel)
-        TFLITE_FLOAT32.write_bytes(float32_bytes)
-        float32_size_mb = len(float32_bytes) / 1024 / 1024
-        print(f"  Saved: {TFLITE_FLOAT32}  ({float32_size_mb:.2f} MB)  "
-              f"[{time.time()-t0:.1f}s]")
-        print("  Evaluating float32 accuracy on test split...")
-        float32_acc, eval_class_names = evaluate_tflite_accuracy(float32_bytes)
-        print(f"  Float32 test accuracy: {float32_acc*100:.2f}%")
-        print(f"  (Class order used for eval: {eval_class_names})\n")
-
-        # ------------------------------------------------------------------
-        # 3. Collect calibration images
-        # ------------------------------------------------------------------
-        print("Step 3: Collecting calibration images...")
-        calibration_images = collect_calibration_images(NUM_CALIBRATION_SAMPLES)
-        print()
-
-        # ------------------------------------------------------------------
-        # 4. INT8 TFLite quantization + accuracy
-        # ------------------------------------------------------------------
-        print("Step 4: Converting to INT8 TFLite (post-training quantization)...")
-        print("  This may take a few minutes on CPU...")
-        t0 = time.time()
-        int8_bytes = convert_to_tflite_int8(tmp_savedmodel, calibration_images)
-        TFLITE_INT8.write_bytes(int8_bytes)
-        int8_size_mb = len(int8_bytes) / 1024 / 1024
-        print(f"  Saved: {TFLITE_INT8}  ({int8_size_mb:.2f} MB)  "
-              f"[{time.time()-t0:.1f}s]")
-        print("  Evaluating INT8 accuracy on test split...")
-        int8_acc, _ = evaluate_tflite_accuracy(int8_bytes)
-        print(f"  INT8 test accuracy: {int8_acc*100:.2f}%\n")
-
-    finally:
-        shutil.rmtree(tmp_savedmodel, ignore_errors=True)
+    # ------------------------------------------------------------------
+    # 1. Load model and export to ONNX float32
+    # ------------------------------------------------------------------
+    print("Step 1: Loading trained model and exporting to ONNX float32...")
+    source, ckpt_classes = load_source_model()
+    print(f"  Classes from checkpoint: {ckpt_classes}")
+    t0 = time.time()
+    export_onnx(source, ONNX_FLOAT32)
+    float32_size_mb = ONNX_FLOAT32.stat().st_size / 1024 / 1024
+    print(f"  Export took {time.time()-t0:.1f}s\n")
 
     # ------------------------------------------------------------------
-    # 5. Validate INT8 outputs against reference
+    # 2. Float32 accuracy
     # ------------------------------------------------------------------
-    print("Step 5: Validating INT8 model outputs against reference...")
-    valid = validate_outputs(source, int8_bytes, calibration_images)
+    print("Step 2: Evaluating float32 ONNX accuracy on test split...")
+    float32_acc, eval_classes = evaluate_onnx_accuracy(ONNX_FLOAT32)
+    print(f"  Float32 test accuracy: {float32_acc*100:.2f}%")
+    print(f"  Class order used for eval: {eval_classes}\n")
+
+    # ------------------------------------------------------------------
+    # 3. Collect calibration images
+    # ------------------------------------------------------------------
+    print("Step 3: Collecting calibration images...")
+    calibration_images = collect_calibration_images(NUM_CALIBRATION_SAMPLES)
     print()
 
     # ------------------------------------------------------------------
-    # 6. Summary
+    # 4. INT8 quantization
+    # ------------------------------------------------------------------
+    print("Step 4: Applying INT8 static quantization...")
+    t0 = time.time()
+    quantize_to_int8(ONNX_FLOAT32, ONNX_INT8, calibration_images)
+    int8_size_mb = ONNX_INT8.stat().st_size / 1024 / 1024
+    print(f"  Quantization took {time.time()-t0:.1f}s\n")
+
+    # ------------------------------------------------------------------
+    # 5. INT8 accuracy
+    # ------------------------------------------------------------------
+    print("Step 5: Evaluating INT8 ONNX accuracy on test split...")
+    int8_acc, _ = evaluate_onnx_accuracy(ONNX_INT8)
+    print(f"  INT8 test accuracy: {int8_acc*100:.2f}%\n")
+
+    # ------------------------------------------------------------------
+    # 6. Output validation
+    # ------------------------------------------------------------------
+    print("Step 6: Validating INT8 model outputs against PyTorch reference...")
+    valid = validate_outputs(source, ONNX_INT8, calibration_images)
+    print()
+
+    # ------------------------------------------------------------------
+    # 7. Summary
     # ------------------------------------------------------------------
     acc_drop = (float32_acc - int8_acc) * 100
     size_reduction = float32_size_mb / int8_size_mb if int8_size_mb > 0 else 0
     print("=== Quantization Summary ===")
-    print(f"  Float32 model size : {float32_size_mb:.2f} MB  →  {TFLITE_FLOAT32.name}")
-    print(f"  INT8 model size    : {int8_size_mb:.2f} MB  →  {TFLITE_INT8.name}")
-    print(f"  Size reduction     : {size_reduction:.1f}x")
-    print(f"  Float32 accuracy   : {float32_acc*100:.2f}%")
-    print(f"  INT8 accuracy      : {int8_acc*100:.2f}%  (drop: {acc_drop:.2f}pp)")
-    print(f"  Output validation  : {'PASSED' if valid else 'FAILED'}")
-    print(f"\n  Deploy {TFLITE_INT8.name} to the Raspberry Pi for Phase 4.\n")
+    print(f"  Float32 size  : {float32_size_mb:.2f} MB  →  {ONNX_FLOAT32.name}")
+    print(f"  INT8 size     : {int8_size_mb:.2f} MB  →  {ONNX_INT8.name}")
+    print(f"  Size reduction: {size_reduction:.1f}x")
+    print(f"  Float32 acc   : {float32_acc*100:.2f}%")
+    print(f"  INT8 acc      : {int8_acc*100:.2f}%  (drop: {acc_drop:.2f}pp)")
+    print(f"  Validation    : {'PASSED' if valid else 'FAILED'}")
+    print(f"\n  Deploy {ONNX_INT8.name} to the Raspberry Pi for Phase 4.\n")
 
     if int8_size_mb > 10:
-        print(f"  WARNING: INT8 model ({int8_size_mb:.1f} MB) exceeds 10 MB target. "
-              "Consider reducing IMAGE_SIZE or using a smaller base model.\n")
+        print(
+            f"  WARNING: INT8 model ({int8_size_mb:.1f} MB) exceeds 10 MB target. "
+            "Consider reducing IMAGE_SIZE or using a smaller backbone.\n"
+        )
 
 
 if __name__ == "__main__":

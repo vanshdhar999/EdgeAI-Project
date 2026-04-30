@@ -1,34 +1,32 @@
-# requirements.txt — GPU training machine (Linux + NVIDIA GPU recommended)
+# requirements.txt — GPU/dev training machine
 #
 # Install with:
 #   pip install -r requirements.txt
 #
 # GPU note:
-#   On Linux with NVIDIA GPU, use:
-#     pip install tensorflow[and-cuda]>=2.18.0
-#   instead of plain tensorflow — it pulls in CUDA/cuDNN wheels automatically.
+#   PyTorch GPU wheels are installed separately from pytorch.org:
+#   https://pytorch.org/get-started/locally/
 #
-#   TF 2.16.x does NOT include pre-compiled CUDA kernels for RTX 5090 (Blackwell,
-#   compute capability 12.0a). Using TF 2.16 will trigger a 30+ minute one-time
-#   JIT PTX compilation before epoch 1. Upgrade to TF 2.18+ to avoid this.
+#   CUDA (Linux + NVIDIA):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 #
-#   On macOS (Apple Silicon), replace with:
-#     pip install tensorflow==2.16.1 tensorflow-metal
+#   Apple Silicon (macOS MPS):
+#     pip install torch torchvision   (MPS support is built-in since PyTorch 1.12)
 #
-# Python: 3.10+ recommended (tested on 3.12.2)
+# Python: 3.10+ (tested on 3.12)
 
-# Core ML framework
-tensorflow>=2.18.0
-keras>=3.14.0
+# Core ML framework (CPU wheels — replace with GPU wheels from pytorch.org for training)
+torch>=2.2.0
+torchvision>=0.17.0
 
-# Model optimization (INT8 quantization, pruning)
-tensorflow-model-optimization==0.8.0
+# ONNX export and quantization
+onnx>=1.16.0
+onnxruntime>=1.18.0
 
 # Data
 numpy==1.26.4
 pillow==12.2.0
 scikit-learn==1.6.0
-scipy==1.13.1
 
 # Visualization
 matplotlib==3.8.4
