@@ -9,6 +9,11 @@ Stage 2: Unfreeze the last STAGE2_UNFREEZE_PARAMS parameters of the feature
 After both stages, the best checkpoint (highest val accuracy across both stages)
 is exported to ONNX format for downstream INT8 quantization (Phase 3).
 
+Supports all dataset modes produced by data_prep.py:
+    "tomato_5"   — 5 classes
+    "tomato_10"  — 10 classes  (more epochs recommended)
+    "multi_crop" — 15 classes  (more epochs recommended)
+
 Usage:
     conda run -n pydl python3 src/train.py
 """
@@ -37,15 +42,20 @@ from augmentation import build_train_transform, build_val_transform
 BATCH_SIZE: int = 32
 IMAGE_SIZE: tuple[int, int] = (224, 224)
 
-STAGE1_EPOCHS: int = 10
-STAGE2_EPOCHS: int = 15
+# Epochs scale with class count — more classes need more training time.
+# These are upper bounds; early stopping will cut runs short when val_acc plateaus.
+#   tomato_5   →  10 / 15
+#   tomato_10  →  15 / 20
+#   multi_crop →  20 / 25
+STAGE1_EPOCHS: int = 15
+STAGE2_EPOCHS: int = 20
 
 STAGE1_LR: float = 1e-3
 STAGE2_LR: float = 1e-5
 
-STAGE2_UNFREEZE_PARAMS: int = 30  # unfreeze last N named params in feature extractor
+STAGE2_UNFREEZE_PARAMS: int = 30
 
-EARLY_STOP_PATIENCE: int = 5
+EARLY_STOP_PATIENCE: int = 7   # slightly more patience for larger class sets
 LR_REDUCE_PATIENCE: int = 3
 LR_REDUCE_FACTOR: float = 0.5
 LR_MIN: float = 1e-7
