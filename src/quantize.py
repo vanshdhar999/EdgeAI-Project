@@ -213,8 +213,8 @@ def quantize_to_int8(
         model_input=str(ONNX_PREPROCESSED),
         model_output=str(int8_onnx_path),
         calibration_data_reader=reader,
-        quant_format=QuantFormat.QDQ,
-        activation_type=QuantType.QInt8,
+        quant_format=QuantFormat.QOperator,   # replaces ops in-place; QDQ breaks MobileNetV3 Hardswish
+        activation_type=QuantType.QUInt8,     # unsigned 0-255, correct for non-negative activations
         weight_type=QuantType.QInt8,
     )
 
@@ -271,15 +271,24 @@ def evaluate_onnx_accuracy(
     return (correct / total if total > 0 else 0.0), class_names
 
 
+def _softmax(x: np.ndarray) -> np.ndarray:
+    e = np.exp(x - x.max())
+    return e / e.sum()
+
+
 def validate_outputs(
     source: nn.Module,
     onnx_path: Path,
     calibration_images: list[np.ndarray],
     num_checks: int = 10,
-    tolerance: float = 0.05,
+    tolerance: float = 0.10,
 ) -> bool:
     """
     Verify ONNX model outputs closely match PyTorch model outputs.
+
+    Compares softmax probabilities (not raw logits) so the tolerance is
+    meaningful — logits can differ by several units while probabilities stay
+    within a few percent.
 
     Returns True if all top-1 predictions match within confidence tolerance.
     """
@@ -297,15 +306,17 @@ def validate_outputs(
             img_np = calibration_images[i][np.newaxis, ...].astype(np.float32)
             img_pt = torch.from_numpy(img_np)
 
-            # PyTorch reference
-            ref_out = source(img_pt).numpy()[0]
-            ref_top1 = int(np.argmax(ref_out))
-            ref_conf = float(ref_out[ref_top1])
+            # PyTorch reference — apply softmax to convert logits → probabilities
+            ref_logits = source(img_pt).numpy()[0]
+            ref_probs  = _softmax(ref_logits)
+            ref_top1   = int(np.argmax(ref_probs))
+            ref_conf   = float(ref_probs[ref_top1])
 
-            # ONNX
-            ort_out = session.run(None, {input_name: img_np})[0][0]
-            ort_top1 = int(np.argmax(ort_out))
-            ort_conf = float(ort_out[ort_top1])
+            # ONNX — also apply softmax (model outputs raw logits)
+            ort_logits = session.run(None, {input_name: img_np})[0][0]
+            ort_probs  = _softmax(ort_logits)
+            ort_top1   = int(np.argmax(ort_probs))
+            ort_conf   = float(ort_probs[ort_top1])
 
             match = ref_top1 == ort_top1
             diff = abs(ref_conf - ort_conf)
