@@ -4,6 +4,7 @@ data/augmented/
 models/checkpoints/
 *.h5
 models/_preprocessed_for_quant.onnx
+logs/
 __pycache__/
 .env
 *.pyc
