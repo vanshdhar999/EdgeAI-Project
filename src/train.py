@@ -305,6 +305,7 @@ def export_to_onnx(model: nn.Module, output_path: Path, device: torch.device) ->
         model,
         dummy_input,
         str(output_path),
+        dynamo=False,        # use legacy TorchScript exporter, no onnxscript needed
         opset_version=17,
         input_names=["input"],
         output_names=["output"],

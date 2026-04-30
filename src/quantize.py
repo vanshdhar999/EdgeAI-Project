@@ -144,6 +144,7 @@ def export_onnx(model: nn.Module, output_path: Path) -> None:
         model,
         dummy,
         str(output_path),
+        dynamo=False,        # use legacy TorchScript exporter, no onnxscript needed
         opset_version=17,
         input_names=["input"],
         output_names=["output"],
