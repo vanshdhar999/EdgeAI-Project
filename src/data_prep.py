@@ -75,17 +75,17 @@ _MULTI_CROP = _TOMATO_10 + [
     "Pepper,_bell___Bacterial_spot",
 ]
 
-# Equal-distribution subset: 3 crops, ~1000 images/class cap applied at split time.
-# Avoids Tomato dominating and keeps class counts balanced for fairer training.
-_BALANCED = [
-    "Tomato___healthy",
-    "Tomato___Early_blight",
-    "Tomato___Late_blight",
+# Equal-distribution subset: all 10 tomato classes + Potato + Pepper + Corn.
+# 1000 images/class cap keeps counts balanced despite PlantVillage skew.
+_BALANCED = _TOMATO_10 + [
+    # Potato (3 classes)
     "Potato___healthy",
     "Potato___Early_blight",
     "Potato___Late_blight",
+    # Pepper (2 classes)
     "Pepper,_bell___healthy",
     "Pepper,_bell___Bacterial_spot",
+    # Corn (2 classes)
     "Corn_(maize)___healthy",
     "Corn_(maize)___Common_rust_",
 ]
