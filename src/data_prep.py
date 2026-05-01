@@ -75,7 +75,8 @@ _MULTI_CROP = _TOMATO_10 + [
     "Pepper,_bell___Bacterial_spot",
 ]
 
-# Equal-distribution subset: all 10 tomato classes + Potato + Pepper + Corn.
+# Equal-distribution subset: all 10 tomato classes + Potato + Pepper.
+# Corn removed — visually distinct from other crops, caused model collapse.
 # 1000 images/class cap keeps counts balanced despite PlantVillage skew.
 _BALANCED = _TOMATO_10 + [
     # Potato (3 classes)
@@ -85,9 +86,6 @@ _BALANCED = _TOMATO_10 + [
     # Pepper (2 classes)
     "Pepper,_bell___healthy",
     "Pepper,_bell___Bacterial_spot",
-    # Corn (2 classes)
-    "Corn_(maize)___healthy",
-    "Corn_(maize)___Common_rust_",
 ]
 
 CLASS_SETS: dict[str, list[str]] = {
