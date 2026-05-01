@@ -75,11 +75,31 @@ _MULTI_CROP = _TOMATO_10 + [
     "Pepper,_bell___Bacterial_spot",
 ]
 
+# Equal-distribution subset: 3 crops, ~1000 images/class cap applied at split time.
+# Avoids Tomato dominating and keeps class counts balanced for fairer training.
+_BALANCED = [
+    "Tomato___healthy",
+    "Tomato___Early_blight",
+    "Tomato___Late_blight",
+    "Potato___healthy",
+    "Potato___Early_blight",
+    "Potato___Late_blight",
+    "Pepper,_bell___healthy",
+    "Pepper,_bell___Bacterial_spot",
+    "Corn_(maize)___healthy",
+    "Corn_(maize)___Common_rust_",
+]
+
 CLASS_SETS: dict[str, list[str]] = {
     "tomato_5":   _TOMATO_5,
     "tomato_10":  _TOMATO_10,
     "multi_crop": _MULTI_CROP,
+    "balanced":   _BALANCED,
 }
+
+# Max images per class when DATASET_MODE == "balanced".
+# Set to None to use all available images.
+MAX_IMAGES_PER_CLASS: int | None = 1000
 
 if DATASET_MODE not in CLASS_SETS:
     raise ValueError(
@@ -111,9 +131,14 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
 # Helpers
 # ---------------------------------------------------------------------------
 
-def collect_images(class_dir: Path) -> list[Path]:
-    """Return a sorted list of valid image paths inside class_dir."""
-    return sorted(p for p in class_dir.iterdir() if p.suffix in IMAGE_EXTENSIONS)
+def collect_images(class_dir: Path, cap: int | None = None, seed: int = 42) -> list[Path]:
+    """Return a sorted list of valid image paths inside class_dir, optionally capped."""
+    all_images = sorted(p for p in class_dir.iterdir() if p.suffix in IMAGE_EXTENSIONS)
+    if cap is not None and len(all_images) > cap:
+        rng = random.Random(seed)
+        all_images = rng.sample(all_images, cap)
+        all_images.sort()
+    return all_images
 
 
 def stratified_split(
@@ -225,7 +250,8 @@ def prepare_dataset() -> None:
     stats: dict[str, dict[str, int]] = {}
 
     for class_name in SELECTED_CLASSES:
-        all_images = collect_images(RAW_DATASET_DIR / class_name)
+        cap = MAX_IMAGES_PER_CLASS if DATASET_MODE == "balanced" else None
+        all_images = collect_images(RAW_DATASET_DIR / class_name, cap=cap, seed=RANDOM_SEED)
         if not all_images:
             raise ValueError(f"No images found in {RAW_DATASET_DIR / class_name}")
 
