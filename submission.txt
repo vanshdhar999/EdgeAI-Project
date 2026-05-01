@@ -1,0 +1,72 @@
+================================================================================
+SUBMISSION — Edge AI Course Project
+================================================================================
+
+PROJECT TITLE
+-------------
+Edge AI Plant Disease Detection System
+
+DESCRIPTION
+-----------
+An offline, edge-deployable plant disease detection system that runs entirely
+on a Raspberry Pi 5. A MobileNetV3-Small model is trained on the PlantVillage
+dataset, exported to ONNX, and quantized to INT8 for real-time inference.
+The system captures live video from the Pi Camera Module v2 and overlays the
+predicted disease class and confidence score directly on the frame — no
+internet connection required at inference time.
+
+TEAM MEMBERS
+------------
+Name               : Aayush Jeevan Patil
+Roll Number        : 22220
+Affiliation        : Computer Science and Engineering
+Email              : (please fill in)
+Contributions      :
+  - Dataset curation and preprocessing pipeline (src/data_prep.py)
+    * Implemented stratified train/val/test split (70/15/15)
+    * Defined all dataset modes: tomato_5, tomato_10, multi_crop, balanced
+    * Verified zero data leakage across splits
+    * Wrote dataset metadata and labels.txt generation
+  - Augmentation strategy (src/augmentation.py)
+    * Designed torchvision augmentation pipeline for training robustness
+    * Random flip, rotation, colour jitter, resized crop
+  - Model training (src/train.py)
+    * Implemented two-stage fine-tuning of MobileNetV3-Small
+    * Stage 1: frozen backbone, head training; Stage 2: partial unfreeze
+    * Early stopping, ReduceLROnPlateau scheduling, checkpoint saving
+  - Evaluation and metrics (src/evaluate.py)
+    * Per-class precision, recall, F1
+    * Confusion matrix generation
+
+Name               : Vansh Dhar
+Roll Number        : 22156
+Affiliation        : Computer Science and Engineering
+Email              : saumysharan25@gmail.com
+Contributions      :
+  - ONNX export and INT8 quantization (src/quantize.py)
+    * Converted PyTorch checkpoint to ONNX (opset 17, legacy exporter)
+    * Applied ONNX Runtime static INT8 quantization with representative dataset
+    * Debugged input tensor renaming issue from quant_pre_process
+  - Hardware benchmarking (src/benchmark.py)
+    * Measured float32 (17.3 ms) and INT8 (6.1 ms) latency on Pi 5
+  - Edge inference engine (deployment/inference.py)
+    * PlantDiseaseClassifier class using ONNX Runtime
+    * ImageNet normalisation, BGR→RGB preprocessing
+  - Live camera system (deployment/live_camera.py)
+    * picamera2 integration with cv2.VideoCapture fallback
+    * Detection state machine: confidence threshold + 10 s hold lock
+    * Structured logging to file and stdout
+  - Pi environment setup (deployment/setup_pi.sh, requirements_pi.txt)
+    * ONNX Runtime ARM64 install, venv with system-site-packages for picamera2
+  - System integration and debugging on Raspberry Pi 5 hardware
+
+GITHUB REPOSITORY
+-----------------
+https://github.com/vanshdhar999/EdgeAI-Project
+
+EXTERNAL DATASET
+----------------
+PlantVillage (color variant)
+https://www.kaggle.com/datasets/emmarex/plantdisease
+
+================================================================================
