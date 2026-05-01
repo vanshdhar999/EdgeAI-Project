@@ -44,6 +44,7 @@ log = logging.getLogger("live_camera")
 # ---------------------------------------------------------------------------
 
 INFER_EVERY_N_FRAMES:  int   = 1
+WARMUP_SECS:           float = 10.0   # seconds to show feed before inference begins
 DISPLAY_WIDTH:         int   = 640
 DISPLAY_HEIGHT:        int   = 480
 WINDOW_TITLE:          str   = "Plant Disease Detection — press Q to quit"
@@ -236,10 +237,11 @@ def run() -> None:
     detection_timestamp = 0.0          # time.perf_counter() when detection was confirmed
 
     log.info(
-        f"Live feed started — threshold={DETECTION_THRESHOLD:.0%}, "
+        f"Live feed started — warmup={WARMUP_SECS}s, threshold={DETECTION_THRESHOLD:.0%}, "
         f"hold={DETECTION_HOLD_SECS}s. Press Q to quit."
     )
     cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
+    start_time = time.perf_counter()
 
     try:
         while True:
@@ -270,7 +272,17 @@ def run() -> None:
             read_errors = 0
             now = time.perf_counter()
 
-            # --- Inference ---
+            # --- Inference (skip during warmup) ---
+            if now - start_time < WARMUP_SECS:
+                frame_idx += 1
+                frame = draw_overlay(frame, state="scanning", label="",
+                                     confidence=0.0, inference_ms=0.0, hold_remaining=0.0)
+                cv2.imshow(WINDOW_TITLE, frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    log.info("Quit key pressed during warmup")
+                    break
+                continue
+
             if frame_idx % INFER_EVERY_N_FRAMES == 0:
                 try:
                     t0 = time.perf_counter()
