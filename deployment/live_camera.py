@@ -43,17 +43,26 @@ log = logging.getLogger("live_camera")
 # Config
 # ---------------------------------------------------------------------------
 
-INFER_EVERY_N_FRAMES: int = 1
-DISPLAY_WIDTH:  int = 640
-DISPLAY_HEIGHT: int = 480
-WINDOW_TITLE:   str = "Plant Disease Detection — press Q to quit"
+INFER_EVERY_N_FRAMES:  int   = 1
+DISPLAY_WIDTH:         int   = 640
+DISPLAY_HEIGHT:        int   = 480
+WINDOW_TITLE:          str   = "Plant Disease Detection — press Q to quit"
+
+# Minimum confidence to count as a valid leaf detection.
+# Below this the overlay shows "No leaf detected" instead of a class name.
+DETECTION_THRESHOLD:   float = 0.80
+
+# How long (seconds) to hold a confirmed detection on screen before
+# reverting to "No leaf detected". Prevents flickering between frames.
+DETECTION_HOLD_SECS:   float = 10.0
 
 FONT           = cv2.FONT_HERSHEY_SIMPLEX
 FONT_SCALE     = 0.7
 FONT_THICKNESS = 2
 TEXT_COLOR     = (255, 255, 255)
-BOX_COLOR      = (0, 150, 0)
-CONF_THRESHOLD = 0.60
+BOX_COLOR      = (0, 150, 0)       # green — healthy
+DISEASE_COLOR  = (0, 80, 200)      # red-ish — disease detected
+SCAN_COLOR     = (80, 80, 80)      # grey — scanning
 
 _DEPLOY_DIR = Path(__file__).resolve().parent
 _PROJECT    = _DEPLOY_DIR.parent
@@ -140,29 +149,41 @@ def open_cv_camera(width: int, height: int):
 
 def draw_overlay(
     frame: np.ndarray,
+    state: str,           # "scanning" | "detected"
     label: str,
     confidence: float,
     inference_ms: float,
+    hold_remaining: float,
 ) -> np.ndarray:
-    short_label = label.split("___", 1)[1] if "___" in label else label
-    short_label = short_label.replace("_", " ")
+    """
+    Draw overlay based on current detection state.
 
-    conf_pct = confidence * 100
-    color = BOX_COLOR if confidence >= CONF_THRESHOLD else (0, 200, 255)
+    "scanning"  — grey box, "No leaf detected"
+    "detected"  — coloured box, disease label + confidence + countdown
+    """
+    pad = 8
 
-    line1 = f"{short_label}"
-    line2 = f"Conf: {conf_pct:.1f}%   Latency: {inference_ms:.0f}ms"
+    if state == "scanning":
+        line1 = "No leaf detected"
+        line2 = f"Latency: {inference_ms:.0f}ms"
+        color = SCAN_COLOR
+    else:
+        short = label.split("___", 1)[1] if "___" in label else label
+        short = short.replace("_", " ")
+        is_healthy = "healthy" in label.lower()
+        color  = BOX_COLOR if is_healthy else DISEASE_COLOR
+        line1  = short
+        line2  = f"Conf: {confidence*100:.1f}%   Hold: {hold_remaining:.0f}s   {inference_ms:.0f}ms"
 
     (w1, h1), _ = cv2.getTextSize(line1, FONT, FONT_SCALE + 0.2, FONT_THICKNESS)
     (w2, h2), _ = cv2.getTextSize(line2, FONT, FONT_SCALE, FONT_THICKNESS)
 
-    pad    = 8
     rect_w = max(w1, w2) + pad * 2
     rect_h = h1 + h2 + pad * 3
 
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (rect_w, rect_h), color, thickness=-1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    bg = frame.copy()
+    cv2.rectangle(bg, (0, 0), (rect_w, rect_h), color, thickness=-1)
+    cv2.addWeighted(bg, 0.65, frame, 0.35, 0, frame)
 
     cv2.putText(frame, line1, (pad, h1 + pad),
                 FONT, FONT_SCALE + 0.2, TEXT_COLOR, FONT_THICKNESS, cv2.LINE_AA)
@@ -203,14 +224,21 @@ def run() -> None:
             sys.exit(1)
 
     # State
-    frame_idx        = 0
-    read_errors      = 0
-    MAX_READ_ERRORS  = 10
-    last_label       = "Initializing..."
-    last_confidence  = 0.0
-    last_latency_ms  = 0.0
+    frame_idx       = 0
+    read_errors     = 0
+    MAX_READ_ERRORS = 10
+    last_label      = ""
+    last_confidence = 0.0
+    last_latency_ms = 0.0
 
-    log.info(f"Live feed started — inferring every {INFER_EVERY_N_FRAMES} frame(s). Press Q to quit.")
+    # Detection hold state
+    detection_state     = "scanning"   # "scanning" | "detected"
+    detection_timestamp = 0.0          # time.perf_counter() when detection was confirmed
+
+    log.info(
+        f"Live feed started — threshold={DETECTION_THRESHOLD:.0%}, "
+        f"hold={DETECTION_HOLD_SECS}s. Press Q to quit."
+    )
     cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
 
     try:
@@ -239,25 +267,55 @@ def run() -> None:
                     time.sleep(0.05)
                     continue
 
-            read_errors = 0  # reset on successful read
-            log.debug(f"Frame {frame_idx}: shape={frame.shape} dtype={frame.dtype}")
+            read_errors = 0
+            now = time.perf_counter()
 
             # --- Inference ---
             if frame_idx % INFER_EVERY_N_FRAMES == 0:
                 try:
                     t0 = time.perf_counter()
-                    last_label, last_confidence = classifier.predict(frame)
+                    label, confidence = classifier.predict(frame)
                     last_latency_ms = (time.perf_counter() - t0) * 1000
-                    log.debug(
-                        f"Frame {frame_idx}: pred={last_label} "
-                        f"conf={last_confidence:.3f} latency={last_latency_ms:.1f}ms"
-                    )
+
+                    if confidence >= DETECTION_THRESHOLD:
+                        # New high-confidence detection — start/reset the hold timer
+                        if detection_state == "scanning" or label != last_label:
+                            log.info(
+                                f"Detection: {label} ({confidence:.3f}) — "
+                                f"holding for {DETECTION_HOLD_SECS}s"
+                            )
+                        last_label          = label
+                        last_confidence     = confidence
+                        detection_state     = "detected"
+                        detection_timestamp = now
+                    else:
+                        log.debug(
+                            f"Frame {frame_idx}: low confidence "
+                            f"{label} ({confidence:.3f}) — scanning"
+                        )
+
                 except Exception as e:
                     log.error(f"Inference failed on frame {frame_idx}: {e}")
                     log.debug(traceback.format_exc())
 
+            # --- Hold timer: revert to scanning after DETECTION_HOLD_SECS ---
+            hold_remaining = 0.0
+            if detection_state == "detected":
+                elapsed = now - detection_timestamp
+                hold_remaining = max(0.0, DETECTION_HOLD_SECS - elapsed)
+                if hold_remaining == 0.0:
+                    log.info("Hold expired — reverting to scanning")
+                    detection_state = "scanning"
+
             # --- Display ---
-            frame = draw_overlay(frame, last_label, last_confidence, last_latency_ms)
+            frame = draw_overlay(
+                frame,
+                state=detection_state,
+                label=last_label,
+                confidence=last_confidence,
+                inference_ms=last_latency_ms,
+                hold_remaining=hold_remaining,
+            )
             cv2.imshow(WINDOW_TITLE, frame)
             frame_idx += 1
 
