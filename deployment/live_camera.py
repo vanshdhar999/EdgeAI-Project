@@ -277,21 +277,20 @@ def run() -> None:
                     label, confidence = classifier.predict(frame)
                     last_latency_ms = (time.perf_counter() - t0) * 1000
 
-                    if confidence >= DETECTION_THRESHOLD:
-                        # New high-confidence detection — start/reset the hold timer
-                        if detection_state == "scanning" or label != last_label:
-                            log.info(
-                                f"Detection: {label} ({confidence:.3f}) — "
-                                f"holding for {DETECTION_HOLD_SECS}s"
-                            )
+                    if detection_state == "scanning" and confidence >= DETECTION_THRESHOLD:
+                        # Lock in detection — ignore all new results for DETECTION_HOLD_SECS
+                        log.info(
+                            f"Detection: {label} ({confidence:.3f}) — "
+                            f"locked for {DETECTION_HOLD_SECS}s"
+                        )
                         last_label          = label
                         last_confidence     = confidence
                         detection_state     = "detected"
                         detection_timestamp = now
                     else:
                         log.debug(
-                            f"Frame {frame_idx}: low confidence "
-                            f"{label} ({confidence:.3f}) — scanning"
+                            f"Frame {frame_idx}: {label} ({confidence:.3f}) "
+                            f"state={detection_state}"
                         )
 
                 except Exception as e:
