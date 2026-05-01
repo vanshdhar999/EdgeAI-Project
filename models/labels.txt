@@ -1,5 +1,3 @@
-Corn_(maize)___Common_rust_
-Corn_(maize)___healthy
 Pepper,_bell___Bacterial_spot
 Pepper,_bell___healthy
 Potato___Early_blight
