@@ -37,7 +37,7 @@ from PIL import Image
 #   "multi_crop"  — 15 classes: Tomato + Potato + Pepper (Option 2)
 # ---------------------------------------------------------------------------
 
-DATASET_MODE: str = "tomato_10"
+DATASET_MODE: str = "multi_crop"
 
 
 # ---------------------------------------------------------------------------
