@@ -41,7 +41,7 @@ Contributions      :
 Name               : Vansh Dhar
 Roll Number        : 22156
 Affiliation        : Computer Science and Engineering
-Email              : saumysharan25@gmail.com
+Email              : vanshdhar@iisc.ac.in
 Contributions      :
   - ONNX export and INT8 quantization (src/quantize.py)
     * Converted PyTorch checkpoint to ONNX (opset 17, legacy exporter)
