@@ -19,8 +19,8 @@ TEAM MEMBERS
 ------------
 Name               : Aayush Jeevan Patil
 Roll Number        : 22220
-Affiliation        : Computer Science and Engineering
-Email              : (please fill in)
+Affiliation        : BTech MnC
+Email              : aayushjeevan@iisc.ac.in
 Contributions      :
   - Dataset curation and preprocessing pipeline (src/data_prep.py)
     * Implemented stratified train/val/test split (70/15/15)
@@ -40,7 +40,7 @@ Contributions      :
 
 Name               : Vansh Dhar
 Roll Number        : 22156
-Affiliation        : Computer Science and Engineering
+Affiliation        : BTech MnC
 Email              : vanshdhar@iisc.ac.in
 Contributions      :
   - ONNX export and INT8 quantization (src/quantize.py)
