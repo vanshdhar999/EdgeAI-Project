@@ -127,3 +127,9 @@ See [`docs/report.md`](docs/report.md) for full results, confusion matrix, and a
 |------|----------|-------------|
 | Aayush Jeevan Patil | 22220 | Dataset pipeline, augmentation, model training, evaluation |
 | Vansh Dhar | 22156 | ONNX export, INT8 quantization, Pi deployment, live camera system |
+
+---
+
+## Disclaimer
+
+This project was developed with assistance from [Claude](https://claude.ai) (Anthropic), an AI assistant. Claude was used to help with code development, debugging, documentation, and architectural decisions throughout the project. All work has been reviewed, understood, and validated by the team members. This disclaimer is included to maintain academic integrity and transparency.
